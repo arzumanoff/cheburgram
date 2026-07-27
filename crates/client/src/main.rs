@@ -328,12 +328,15 @@ impl CheburgramApp {
         let mic_level = self.mic_level.clone();
         let packets_sent = self.packets_sent.clone();
         let packets_recv = self.packets_recv.clone();
+        let input_dev_name = self.devices.input_devices.get(self.devices.selected_input).cloned().unwrap_or_default();
+        let output_dev_name = self.devices.output_devices.get(self.devices.selected_output).cloned().unwrap_or_default();
 
         // 1. Захват микрофона
         let socket_send = udp_socket.clone();
         let room_code_send = room_code;
         thread::spawn(move || {
             if let Err(e) = run_audio_input_loop(
+                input_dev_name,
                 socket_send,
                 target_udp_addr,
                 room_code_send,
@@ -350,7 +353,12 @@ impl CheburgramApp {
         let socket_recv = udp_socket;
         let stop_signal_recv = self.stop_signal.clone();
         thread::spawn(move || {
-            if let Err(e) = run_audio_output_loop(socket_recv, stop_signal_recv, packets_recv) {
+            if let Err(e) = run_audio_output_loop(
+                output_dev_name,
+                socket_recv,
+                stop_signal_recv,
+                packets_recv,
+            ) {
                 error!("Ошибка аудио вывода: {:?}", e);
             }
         });
@@ -413,6 +421,7 @@ impl CheburgramApp {
 }
 
 fn run_audio_input_loop(
+    device_name: String,
     socket: Arc<StdUdpSocket>,
     target_addr: SocketAddr,
     room_code: String,
@@ -422,29 +431,62 @@ fn run_audio_input_loop(
     packets_sent: Arc<AtomicU64>,
 ) -> Result<()> {
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| anyhow!("Микрофон не найден"))?;
-
-    let config: cpal::StreamConfig = cpal::StreamConfig {
-        channels: 1,
-        sample_rate: cpal::SampleRate(SAMPLE_RATE),
-        buffer_size: cpal::BufferSize::Fixed(FRAME_SIZE as u32),
+    let device = if !device_name.is_empty() && device_name != "По умолчанию" {
+        host.input_devices()?
+            .find(|d| d.name().ok().as_deref() == Some(&device_name))
+            .unwrap_or_else(|| host.default_input_device().expect("Микрофон не найден"))
+    } else {
+        host.default_input_device().ok_or_else(|| anyhow!("Микрофон не найден"))?
     };
 
+    let default_config = device.default_input_config()?;
+    let sample_format = default_config.sample_format();
+    let config: cpal::StreamConfig = default_config.into();
+    let channels = config.channels as usize;
+
     let mut encoder = Encoder::new(SAMPLE_RATE, Channels::Mono, Application::Voip)?;
-    let pcm_buf = Arc::new(Mutex::new(Vec::<f32>::with_capacity(FRAME_SIZE * 2)));
+    let pcm_buf = Arc::new(Mutex::new(Vec::<f32>::with_capacity(FRAME_SIZE * 4)));
 
     let pcm_buf_capture = pcm_buf.clone();
-    let stream = device.build_input_stream(
-        &config,
-        move |data: &[f32], _: &_| {
-            let mut buf = pcm_buf_capture.lock().unwrap();
-            buf.extend_from_slice(data);
-        },
-        |err| error!("Ошибка CPAL микрофона: {}", err),
-        None,
-    )?;
+    let err_fn = |err| error!("Ошибка CPAL микрофона: {}", err);
+
+    let stream = match sample_format {
+        cpal::SampleFormat::F32 => device.build_input_stream(
+            &config,
+            move |data: &[f32], _: &_| {
+                let mut buf = pcm_buf_capture.lock().unwrap();
+                if channels == 1 {
+                    buf.extend_from_slice(data);
+                } else {
+                    for chunk in data.chunks(channels) {
+                        let sum: f32 = chunk.iter().sum();
+                        buf.push(sum / channels as f32);
+                    }
+                }
+            },
+            err_fn,
+            None,
+        )?,
+        cpal::SampleFormat::I16 => device.build_input_stream(
+            &config,
+            move |data: &[i16], _: &_| {
+                let mut buf = pcm_buf_capture.lock().unwrap();
+                if channels == 1 {
+                    for &s in data {
+                        buf.push(s as f32 / 32768.0);
+                    }
+                } else {
+                    for chunk in data.chunks(channels) {
+                        let sum: f32 = chunk.iter().map(|&s| s as f32 / 32768.0).sum();
+                        buf.push(sum / channels as f32);
+                    }
+                }
+            },
+            err_fn,
+            None,
+        )?,
+        _ => return Err(anyhow!("Неподдерживаемый формат аудио")),
+    };
 
     stream.play()?;
 
@@ -494,14 +536,19 @@ fn run_audio_input_loop(
 }
 
 fn run_audio_output_loop(
+    device_name: String,
     socket: Arc<StdUdpSocket>,
     stop_signal: Arc<AtomicBool>,
     packets_recv: Arc<AtomicU64>,
 ) -> Result<()> {
     let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or_else(|| anyhow!("Устройство воспроизведения не найдено"))?;
+    let device = if !device_name.is_empty() && device_name != "По умолчанию" {
+        host.output_devices()?
+            .find(|d| d.name().ok().as_deref() == Some(&device_name))
+            .unwrap_or_else(|| host.default_output_device().expect("Динамики не найдены"))
+    } else {
+        host.default_output_device().ok_or_else(|| anyhow!("Динамики не найдены"))?
+    };
 
     let config: cpal::StreamConfig = cpal::StreamConfig {
         channels: 1,
@@ -714,7 +761,7 @@ impl eframe::App for CheburgramApp {
 
                     let mic_val = self.mic_level.load(Ordering::Relaxed) as f32 / 100.0;
                     ui.label("Громкость микрофона:");
-                    ui.add(egui::ProgressBar::new(mic_val).animate(true));
+                    ui.add(egui::ProgressBar::new(mic_val).text(format!("{:.0}%", mic_val * 100.0)));
 
                     ui.add_space(20.0);
 
