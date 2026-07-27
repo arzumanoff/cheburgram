@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, Result};
 use cheburgram_protocol::{
-    AudioPacket, CallDirection, CallRecord, ControlMessage, FriendRequestInfo, FriendStatus,
+    AudioPacket, CallDirection, CallRecord, ControlMessage, FriendRequestInfo, FriendStatus, TextMessage,
 };
 use chrono::Utc;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -226,6 +226,11 @@ struct App {
     _tray_icon: Option<TrayIcon>,
     tray_open_id: Option<tray_icon::menu::MenuId>,
     tray_quit_id: Option<tray_icon::menu::MenuId>,
+
+    // Текстовые сообщения (SMS / Чат)
+    chat_active_friend: Option<SavedFriend>,
+    chat_messages: std::collections::HashMap<String, Vec<TextMessage>>,
+    chat_input: String,
 }
 
 impl Default for App {
@@ -268,6 +273,9 @@ impl Default for App {
             _tray_icon: tray_icon,
             tray_open_id: open_id,
             tray_quit_id: quit_id,
+            chat_active_friend: None,
+            chat_messages: std::collections::HashMap::new(),
+            chat_input: String::new(),
         }
     }
 }
@@ -376,6 +384,30 @@ impl App {
 
         self.status = format!("Отправка запроса в друзья ID {}...", clean);
         self.send_msg(ControlMessage::SendFriendRequest { target_code: clean });
+    }
+
+    fn send_text_message(&mut self, target_code: String, text: String) {
+        let text_clean = text.trim().to_string();
+        if text_clean.is_empty() { return; }
+        let msg_id = Uuid::new_v4().to_string();
+        let my_code = self.cfg.user_code.clone();
+        let my_name = self.cfg.display_name.clone();
+
+        let msg = TextMessage {
+            id: msg_id.clone(),
+            from_code: my_code,
+            from_name: my_name,
+            to_code: target_code.clone(),
+            text: text_clean.clone(),
+            timestamp: Utc::now().to_rfc3339(),
+        };
+
+        self.chat_messages.entry(target_code.clone()).or_default().push(msg);
+        self.send_msg(ControlMessage::SendTextMessage {
+            target_code,
+            text: text_clean,
+            message_id: msg_id,
+        });
     }
 
     fn accept_friend_request(&mut self, from_code: String) {
@@ -598,6 +630,14 @@ impl App {
                 ControlMessage::FriendsStatus { friends } => {
                     for f in friends {
                         self.friend_statuses.insert(f.user_code.clone(), f);
+                    }
+                }
+                ControlMessage::IncomingTextMessage { msg } => {
+                    self.chat_messages.entry(msg.from_code.clone()).or_default().push(msg);
+                }
+                ControlMessage::PendingTextMessages { messages } => {
+                    for m in messages {
+                        self.chat_messages.entry(m.from_code.clone()).or_default().push(m);
                     }
                 }
                 ControlMessage::UserStatusChanged { user_code, is_online, peer_id } => {
@@ -1014,6 +1054,8 @@ impl eframe::App for App {
             }
         });
 
+        self.draw_chat_modal(ctx);
+
         ctx.request_repaint_after(Duration::from_millis(50));
     }
 }
@@ -1254,12 +1296,22 @@ impl App {
 
                                 ui.add_space(4.0);
 
-                                let btn = egui::Button::new(
-                                    egui::RichText::new("Позвонить").strong().color(egui::Color32::WHITE)
+                                let btn_call = egui::Button::new(
+                                    egui::RichText::new("📞 Позвонить").strong().color(egui::Color32::WHITE)
                                 ).fill(if is_online { CLR_GREEN } else { CLR_SURFACE2 });
 
-                                if ui.add_enabled(is_online, btn).clicked() {
+                                if ui.add_enabled(is_online, btn_call).clicked() {
                                     call_action = Some((f.user_code.clone(), f.name.clone()));
+                                }
+
+                                ui.add_space(4.0);
+
+                                let btn_chat = egui::Button::new(
+                                    egui::RichText::new("💬 Чат").strong().color(egui::Color32::WHITE)
+                                ).fill(CLR_BLUE);
+
+                                if ui.add(btn_chat).clicked() {
+                                    self.chat_active_friend = Some(f.clone());
                                 }
                             });
                         });
@@ -1278,6 +1330,89 @@ impl App {
                 self.call_user(code, name);
             }
         });
+    }
+
+    fn draw_chat_modal(&mut self, ctx: &egui::Context) {
+        let friend = match self.chat_active_friend.clone() {
+            Some(f) => f,
+            None => return,
+        };
+
+        let mut open = true;
+        egui::Window::new(format!("💬 Чат с {} (ID: {})", friend.name, friend.user_code))
+            .open(&mut open)
+            .resizable(true)
+            .collapsible(false)
+            .default_size(egui::vec2(420.0, 500.0))
+            .min_size(egui::vec2(320.0, 380.0))
+            .show(ctx, |ui| {
+                let msgs = self.chat_messages.entry(friend.user_code.clone()).or_default().clone();
+
+                egui::TopBottomPanel::bottom("chat_input_panel")
+                    .frame(egui::Frame::none().fill(CLR_SURFACE).inner_margin(egui::Margin::same(8.0)))
+                    .show_inside(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut self.chat_input)
+                                    .hint_text("Введите сообщение...")
+                                    .desired_width(ui.available_width() - 90.0)
+                                    .font(egui::FontId::proportional(14.0))
+                                    .text_color(CLR_TEXT)
+                            );
+                            let send_clicked = ui.add(
+                                egui::Button::new(
+                                    egui::RichText::new("Отправить").strong().color(egui::Color32::WHITE)
+                                ).fill(CLR_ACCENT)
+                            ).clicked();
+
+                            if (send_clicked || (resp.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)))) && !self.chat_input.trim().is_empty() {
+                                let txt = self.chat_input.clone();
+                                self.chat_input.clear();
+                                self.send_text_message(friend.user_code.clone(), txt);
+                            }
+                        });
+                    });
+
+                egui::CentralPanel::default().frame(egui::Frame::none().fill(CLR_BG).inner_margin(egui::Margin::same(10.0))).show_inside(ui, |ui| {
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
+                        if msgs.is_empty() {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(40.0);
+                                ui.label(egui::RichText::new("Сообщений пока нет. Напишите первым!").color(CLR_TEXT_DIM).small());
+                            });
+                        } else {
+                            for m in &msgs {
+                                let is_me = m.from_code == self.cfg.user_code;
+                                ui.horizontal(|ui| {
+                                    if is_me {
+                                        let space_w = (ui.available_width() - 260.0).max(0.0);
+                                        ui.add_space(space_w);
+                                    }
+                                    egui::Frame::none()
+                                        .fill(if is_me { egui::Color32::from_rgb(30, 75, 120) } else { CLR_SURFACE })
+                                        .rounding(egui::Rounding::same(8.0))
+                                        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                                        .stroke(egui::Stroke::new(1.0, if is_me { CLR_BLUE } else { CLR_BORDER }))
+                                        .show(ui, |ui| {
+                                            ui.set_max_width(240.0);
+                                            ui.vertical(|ui| {
+                                                if !is_me {
+                                                    ui.label(egui::RichText::new(&m.from_name).size(11.0).color(CLR_ACCENT).strong());
+                                                }
+                                                ui.label(egui::RichText::new(&m.text).size(14.0).color(CLR_TEXT));
+                                            });
+                                        });
+                                });
+                                ui.add_space(4.0);
+                            }
+                        }
+                    });
+                });
+            });
+
+        if !open {
+            self.chat_active_friend = None;
+        }
     }
 
     fn draw_calling(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, to_name: &str) {

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-/// Статус друга
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Информация о друге/контакте
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FriendStatus {
     pub user_code: String,
     pub name: String,
@@ -10,14 +10,25 @@ pub struct FriendStatus {
 }
 
 /// Запрос в друзья
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FriendRequestInfo {
     pub from_code: String,
     pub from_name: String,
 }
 
+/// Текстовое сообщение (SMS / Чат)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TextMessage {
+    pub id: String,
+    pub from_code: String,
+    pub from_name: String,
+    pub to_code: String,
+    pub text: String,
+    pub timestamp: String, // ISO 8601
+}
+
 /// Запись о звонке (для истории)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CallRecord {
     pub peer_name: String,
     pub direction: CallDirection,
@@ -32,8 +43,8 @@ pub enum CallDirection {
     Missed,
 }
 
-/// Все сигнальные сообщения (TCP)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Все сигнальные и управляющие сообщения (TCP)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ControlMessage {
     // === Регистрация ===
     Register {
@@ -75,6 +86,23 @@ pub enum ControlMessage {
         requests: Vec<FriendRequestInfo>,
     },
 
+    // === Текстовые сообщения (SMS / Чат) ===
+    SendTextMessage {
+        target_code: String,
+        text: String,
+        message_id: String,
+    },
+    IncomingTextMessage {
+        msg: TextMessage,
+    },
+    TextMessageAck {
+        message_id: String,
+        delivered: bool,
+    },
+    PendingTextMessages {
+        messages: Vec<TextMessage>,
+    },
+
     // === Уведомления присутствия ===
     UserStatusChanged {
         user_code: String,
@@ -111,7 +139,7 @@ pub enum ControlMessage {
         peer_name: String,
     },
 
-    // === Служебное ===
+    // === Служебные сообщения ===
     Ping,
     Pong,
     Error {
@@ -120,14 +148,14 @@ pub enum ControlMessage {
 }
 
 /// UDP аудио пакет
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AudioPacketHeader {
     pub room_id: u64,
     pub sender_id: u32,
     pub sequence: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AudioPacket {
     pub header: AudioPacketHeader,
     pub payload: Vec<u8>,
@@ -147,5 +175,30 @@ impl AudioPacket {
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
         serde_json::from_slice(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_control_message_serde() {
+        let msg = ControlMessage::SendTextMessage {
+            target_code: "123456".to_string(),
+            text: "Привет, Чебурашка!".to_string(),
+            message_id: "msg-1".to_string(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let decoded: ControlMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn test_audio_packet_bytes() {
+        let pkt = AudioPacket::new(42, 7, 100, vec![1, 2, 3, 4, 5]);
+        let bytes = pkt.to_bytes().unwrap();
+        let decoded = AudioPacket::from_bytes(&bytes).unwrap();
+        assert_eq!(pkt, decoded);
     }
 }
