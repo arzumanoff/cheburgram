@@ -16,5 +16,5 @@ pub use jitter::{JitterBuffer, Pop};
 
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const FRAME_SIZE: usize = 960; // 20 мс при 48 кГц
-pub const OPUS_BITRATE: i32 = 24_000;
+pub const OPUS_BITRATE: i32 = 32_000;
 pub const MAX_OPUS_BYTES: usize = 4000;

@@ -833,9 +833,10 @@ fn draw_in_call(app: &mut App, ui: &mut egui::Ui, peer_name: &str, started_at: s
                         ui.add_space(8.0);
                         ui.label(
                             egui::RichText::new(format!(
-                                "Отпр: {}  Получ: {}",
+                                "Отпр: {}  Получ: {}  Пропуски: {}",
                                 app.pkts_sent(),
-                                app.pkts_recv()
+                                app.pkts_recv(),
+                                app.audio_underruns()
                             ))
                             .small()
                             .color(CLR_TEXT_DIM),

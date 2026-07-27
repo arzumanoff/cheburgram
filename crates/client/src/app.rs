@@ -431,6 +431,14 @@ impl App {
             .unwrap_or(0)
     }
 
+    /// Сколько раз кольцо воспроизведения пустовало (диагностика «скрипов»)
+    pub fn audio_underruns(&self) -> u64 {
+        self.audio
+            .as_ref()
+            .map(|a| a.stats.underruns.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
     pub fn audio_error(&self) -> Option<String> {
         self.audio
             .as_ref()
