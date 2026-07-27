@@ -774,6 +774,35 @@ impl eframe::App for CheburgramApp {
     }
 }
 
+fn setup_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    // Загружаем эмодзи шрифт Windows (Segoe UI Emoji / Segoe UI Symbol)
+    let emoji_paths = [
+        "C:\\Windows\\Fonts\\seguiemj.ttf",
+        "C:\\Windows\\Fonts\\segoeui.ttf",
+    ];
+
+    for path in &emoji_paths {
+        if let Ok(font_data) = fs::read(path) {
+            let name = path.split('\\').last().unwrap_or("font").to_string();
+            fonts.font_data.insert(
+                name.clone(),
+                egui::FontData::from_owned(font_data),
+            );
+
+            if let Some(vec) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                vec.push(name.clone());
+            }
+            if let Some(vec) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+                vec.push(name);
+            }
+        }
+    }
+
+    ctx.set_fonts(fonts);
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
@@ -791,7 +820,10 @@ fn main() -> Result<()> {
     eframe::run_native(
         "Cheburgram Voice",
         native_options,
-        Box::new(|_cc| Box::new(CheburgramApp::default())),
+        Box::new(|cc| {
+            setup_fonts(&cc.egui_ctx);
+            Box::new(CheburgramApp::default())
+        }),
     )
     .map_err(|e| anyhow!("Ошибка запуска GUI: {}", e))?;
 
