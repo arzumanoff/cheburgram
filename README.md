@@ -16,7 +16,9 @@
 git clone https://github.com/arzumanoff/cheburgram.git
 cd cheburgram
 
-# Запуск в Docker
+# Запуск в Docker (используйте docker-compose или docker compose):
+docker-compose up -d --build
+# или
 docker compose up -d --build
 ```
 
