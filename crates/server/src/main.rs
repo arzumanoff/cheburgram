@@ -69,20 +69,34 @@ async fn main() -> Result<()> {
                     if let Ok(packet) = AudioPacket::from_bytes(data) {
                         let mut st = state_udp.lock().await;
 
+                        let is_new = !st.udp_peers.contains_key(&src_addr);
                         // Регистрируем/обновляем UDP адрес отправителя
                         st.udp_peers.insert(src_addr, (packet.header.room_code.clone(), packet.header.sender_id));
 
                         if let Some(room) = st.rooms.get_mut(&packet.header.room_code) {
                             if let Some(p) = room.participants.get_mut(&packet.header.sender_id) {
+                                if is_new || p.udp_addr.is_none() {
+                                    info!("📍 UDP зарегистрирован: peer={} addr={} room={}", 
+                                          packet.header.sender_id, src_addr, packet.header.room_code);
+                                }
                                 p.udp_addr = Some(src_addr);
+                            } else {
+                                info!("⚠️ UDP пакет от неизвестного peer={} в комнате {}", 
+                                      packet.header.sender_id, packet.header.room_code);
                             }
 
                             // Пустые пакеты — только регистрация UDP адреса, не пересылаем
                             if packet.payload.is_empty() {
+                                let known_peers: Vec<String> = room.participants.iter()
+                                    .map(|(id, p)| format!("peer{}={:?}", id, p.udp_addr))
+                                    .collect();
+                                info!("🔔 UDP ping от peer={} | Комната: {}", 
+                                      packet.header.sender_id, known_peers.join(", "));
                                 continue;
                             }
 
                             // Пересылаем пакет ВСЕМ ДРУГИМ участникам комнаты
+                            let mut forwarded = 0u32;
                             for (&peer_id, participant) in &room.participants {
                                 if peer_id != packet.header.sender_id {
                                     if let Some(target_addr) = participant.udp_addr {
@@ -91,10 +105,21 @@ async fn main() -> Result<()> {
                                         tokio::spawn(async move {
                                             let _ = udp_send.send_to(&packet_bytes, target_addr).await;
                                         });
+                                        forwarded += 1;
+                                    } else {
+                                        info!("⚠️ Нет UDP адреса для peer={}, пропускаем", peer_id);
                                     }
                                 }
                             }
+                            if forwarded == 0 {
+                                info!("⚠️ Пакет от peer={} некуда переслать (собеседник не зарегистрировал UDP)", 
+                                      packet.header.sender_id);
+                            }
+                        } else {
+                            info!("⚠️ UDP пакет для несуществующей комнаты: {}", packet.header.room_code);
                         }
+                    } else {
+                        info!("⚠️ Не удалось десериализовать UDP пакет от {}, размер={}", src_addr, len);
                     }
                 }
                 Err(e) => {
