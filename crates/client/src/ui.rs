@@ -64,7 +64,11 @@ pub fn draw_root(app: &mut App, ctx: &egui::Context) {
     // экран входа
     if !app.is_connected && app.cfg.display_name.is_empty() {
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(CLR_BG))
+            .frame(
+                egui::Frame::none()
+                    .fill(CLR_BG)
+                    .inner_margin(egui::Margin::symmetric(16.0, 0.0)),
+            )
             .show(ctx, |ui| draw_login(app, ui, ctx));
         ctx.request_repaint_after(Duration::from_millis(50));
         return;
@@ -76,21 +80,33 @@ pub fn draw_root(app: &mut App, ctx: &egui::Context) {
     match app.call_state.clone() {
         CallState::Calling { target_name, .. } => {
             egui::CentralPanel::default()
-                .frame(egui::Frame::none().fill(CLR_BG))
+                .frame(
+                    egui::Frame::none()
+                        .fill(CLR_BG)
+                        .inner_margin(egui::Margin::symmetric(10.0, 0.0)),
+                )
                 .show(ctx, |ui| draw_calling(app, ui, ctx, &target_name));
             ctx.request_repaint_after(Duration::from_millis(50));
             return;
         }
         CallState::IncomingCall { from_name, from_peer_id, .. } => {
             egui::CentralPanel::default()
-                .frame(egui::Frame::none().fill(CLR_BG))
+                .frame(
+                    egui::Frame::none()
+                        .fill(CLR_BG)
+                        .inner_margin(egui::Margin::symmetric(10.0, 0.0)),
+                )
                 .show(ctx, |ui| draw_incoming(app, ui, ctx, from_peer_id, &from_name));
             ctx.request_repaint_after(Duration::from_millis(50));
             return;
         }
         CallState::InCall { peer_name, started_at, .. } => {
             egui::CentralPanel::default()
-                .frame(egui::Frame::none().fill(CLR_BG))
+                .frame(
+                    egui::Frame::none()
+                        .fill(CLR_BG)
+                        .inner_margin(egui::Margin::symmetric(10.0, 0.0)),
+                )
                 .show(ctx, |ui| draw_in_call(app, ui, &peer_name, started_at));
             ctx.request_repaint_after(Duration::from_millis(50));
             return;
@@ -105,7 +121,7 @@ pub fn draw_root(app: &mut App, ctx: &egui::Context) {
                 draw_chebu_icon(ui, 26.0);
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new("Cheburgram").size(15.0).strong().color(CLR_ACCENT));
-                ui.add_space(16.0);
+                ui.add_space(14.0);
 
                 let tab_btn = |ui: &mut egui::Ui, current: Tab, target: Tab, text: &str| -> bool {
                     let is_sel = current == target;
@@ -114,6 +130,7 @@ pub fn draw_root(app: &mut App, ctx: &egui::Context) {
                     ui.add(
                         egui::Button::new(egui::RichText::new(text).size(13.0).color(fg).strong())
                             .fill(bg)
+                            .min_size(egui::vec2(108.0, 28.0))
                             .rounding(egui::Rounding::same(6.0)),
                     )
                     .clicked()
@@ -151,7 +168,11 @@ pub fn draw_root(app: &mut App, ctx: &egui::Context) {
         });
 
     egui::CentralPanel::default()
-        .frame(egui::Frame::none().fill(CLR_BG))
+        .frame(
+            egui::Frame::none()
+                .fill(CLR_BG)
+                .inner_margin(egui::Margin::symmetric(14.0, 4.0)),
+        )
         .show(ctx, |ui| match app.active_tab {
             Tab::Contacts => draw_contacts(app, ui, ctx),
             Tab::History => draw_history(app, ui),
@@ -299,8 +320,16 @@ fn draw_login(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
 
 // ─── Контакты ────────────────────────────────────────────────────────────────
 
+/// Оставить в строке только цифры, не более 6 (ловит и вставку из буфера)
+fn sanitize_id_input(s: &mut String) {
+    let filtered: String = s.chars().filter(|c| c.is_ascii_digit()).take(6).collect();
+    if filtered != *s {
+        *s = filtered;
+    }
+}
+
 fn draw_contacts(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
-    ui.add_space(8.0);
+    ui.add_space(6.0);
 
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         // Мой ID
@@ -351,27 +380,38 @@ fn draw_contacts(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut app.add_friend_input)
                             .hint_text("6 цифр")
-                            .desired_width(100.0)
+                            .desired_width(110.0)
                             .font(egui::FontId::monospace(14.0))
                             .text_color(CLR_TEXT),
                     );
-                    if resp.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    // только цифры (паста из буфера с мусором очистится сама)
+                    sanitize_id_input(&mut app.add_friend_input);
+
+                    let send = resp.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter));
+                    if send && app.add_friend_input.len() == 6 {
                         let code = app.add_friend_input.clone();
+                        app.add_friend_input.clear();
                         app.send_friend_request(&code);
                     }
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new("Отправить запрос").strong().color(egui::Color32::WHITE),
-                            )
-                            .fill(CLR_ACCENT),
-                        )
-                        .clicked()
-                    {
+                    let ready = app.add_friend_input.len() == 6;
+                    let btn = egui::Button::new(
+                        egui::RichText::new("Отправить запрос").strong().color(egui::Color32::WHITE),
+                    )
+                    .fill(if ready { CLR_ACCENT } else { CLR_SURFACE2 });
+                    if ui.add_enabled(ready, btn).on_hover_text("или Enter").clicked() {
                         let code = app.add_friend_input.clone();
+                        app.add_friend_input.clear();
                         app.send_friend_request(&code);
                     }
                 });
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Можно просто вставить ID из буфера (Ctrl+V) — лишние символы отфильтруются",
+                    )
+                    .small()
+                    .color(CLR_TEXT_DIM),
+                );
             });
 
         // Входящие заявки
@@ -497,6 +537,7 @@ fn draw_contacts(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                                     egui::Button::new(egui::RichText::new("🗑").small().color(CLR_TEXT_DIM))
                                         .fill(egui::Color32::TRANSPARENT),
                                 )
+                                .on_hover_text("Удалить из друзей")
                                 .clicked()
                             {
                                 remove_action = Some(f.user_code.clone());
@@ -517,7 +558,7 @@ fn draw_contacts(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
                             )
                             .fill(CLR_BLUE);
                             if ui.add(btn_chat).clicked() {
-                                app.chat_active_friend = Some(f.clone());
+                                app.open_chat(f.user_code.clone(), f.name.clone());
                             }
                         });
                     });
@@ -551,6 +592,46 @@ fn draw_chat_modal(app: &mut App, ctx: &egui::Context) {
         .min_size(egui::vec2(320.0, 380.0))
         .show(ctx, |ui| {
             let msgs = app.chat_messages.entry(friend.user_code.clone()).or_default().clone();
+
+            // панель действий: позвонить / добавить в друзья — в один клик
+            egui::TopBottomPanel::top("chat_actions_panel")
+                .frame(egui::Frame::none().fill(CLR_SURFACE).inner_margin(egui::Margin::same(8.0)))
+                .show_inside(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let is_friend =
+                            app.cfg.friends.iter().any(|f| f.user_code == friend.user_code);
+                        let is_online = app
+                            .friend_statuses
+                            .get(&friend.user_code)
+                            .map(|s| s.is_online)
+                            .unwrap_or(false);
+                        // не-другу можно звонить «вслепую» — сервер ответит статусом
+                        let can_call = !is_friend || is_online;
+
+                        let btn_call = egui::Button::new(
+                            egui::RichText::new("📞 Позвонить").strong().color(egui::Color32::WHITE),
+                        )
+                        .fill(if is_online { CLR_GREEN } else { CLR_SURFACE2 });
+                        if ui
+                            .add_enabled(can_call, btn_call)
+                            .on_hover_text(if is_online { "Начать звонок" } else { "Собеседник не в сети" })
+                            .clicked()
+                        {
+                            app.call_user(friend.user_code.clone(), friend.name.clone());
+                        }
+
+                        if !is_friend {
+                            ui.add_space(6.0);
+                            let btn_add = egui::Button::new(
+                                egui::RichText::new("➕ В друзья").strong().color(egui::Color32::WHITE),
+                            )
+                            .fill(CLR_ACCENT);
+                            if ui.add(btn_add).clicked() {
+                                app.send_friend_request(&friend.user_code);
+                            }
+                        }
+                    });
+                });
 
             egui::TopBottomPanel::bottom("chat_input_panel")
                 .frame(egui::Frame::none().fill(CLR_SURFACE).inner_margin(egui::Margin::same(8.0)))
@@ -746,7 +827,6 @@ fn draw_incoming(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, from_pee
                         app.accept_call(from_peer_id, n1);
                     }
                     ui.add_space(16.0);
-                    let n2 = from_name.to_string();
                     if ui
                         .add(
                             egui::Button::new(
@@ -757,7 +837,7 @@ fn draw_incoming(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, from_pee
                         )
                         .clicked()
                     {
-                        app.reject_call(from_peer_id, &n2);
+                        app.reject_call(from_peer_id);
                     }
                 });
             });
@@ -925,9 +1005,22 @@ fn draw_in_call(app: &mut App, ui: &mut egui::Ui, peer_name: &str, started_at: s
 
 // ─── История ─────────────────────────────────────────────────────────────────
 
-fn draw_history(app: &App, ui: &mut egui::Ui) {
-    ui.add_space(12.0);
+/// Действие из строки истории
+enum HistAction {
+    Call(String, String),
+    Chat(String, String),
+    AddFriend(String),
+}
+
+fn draw_history(app: &mut App, ui: &mut egui::Ui) {
+    ui.add_space(8.0);
     ui.label(egui::RichText::new("История звонков").size(15.0).strong().color(CLR_TEXT));
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new("📞 — перезвонить, 💬 — написать, ➕ — добавить в друзья")
+            .small()
+            .color(CLR_TEXT_DIM),
+    );
     ui.add_space(8.0);
 
     if app.cfg.call_history.is_empty() {
@@ -938,8 +1031,19 @@ fn draw_history(app: &App, ui: &mut egui::Ui) {
         return;
     }
 
+    let history = app.cfg.call_history.clone();
+    let friends = app.cfg.friends.clone();
+    let statuses = app.friend_statuses.clone();
+    let mut action: Option<HistAction> = None;
+
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        for r in &app.cfg.call_history {
+        for r in &history {
+            let known_code = !r.peer_code.is_empty();
+            let is_friend = friends.iter().any(|f| f.user_code == r.peer_code);
+            let is_online = statuses.get(&r.peer_code).map(|s| s.is_online).unwrap_or(false);
+            // другу — только если онлайн; не-другу (статус неизвестен) — даём попробовать
+            let can_call = known_code && (!is_friend || is_online);
+
             egui::Frame::none()
                 .fill(CLR_SURFACE)
                 .rounding(egui::Rounding::same(8.0))
@@ -959,32 +1063,96 @@ fn draw_history(app: &App, ui: &mut egui::Ui) {
                         ui.add_space(8.0);
                         ui.vertical(|ui| {
                             ui.label(egui::RichText::new(&r.peer_name).strong().color(CLR_TEXT));
-                            ui.label(egui::RichText::new(dir_txt).small().color(dir_col));
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(dir_txt).small().color(dir_col));
+                                let ts = r.timestamp.get(..16).unwrap_or(&r.timestamp).replace('T', " ");
+                                let sub = if r.duration_secs > 0 {
+                                    format!(
+                                        "{:02}:{:02} • {}",
+                                        r.duration_secs / 60,
+                                        r.duration_secs % 60,
+                                        ts
+                                    )
+                                } else {
+                                    ts
+                                };
+                                ui.label(egui::RichText::new(sub).small().color(CLR_TEXT_DIM));
+                            });
                         });
+
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let dur = if r.duration_secs > 0 {
-                                format!("{:02}:{:02}", r.duration_secs / 60, r.duration_secs % 60)
-                            } else {
-                                "—".to_string()
-                            };
-                            ui.label(egui::RichText::new(dur).small().color(CLR_TEXT_DIM));
-                            // дата-время записи
-                            let ts = r.timestamp.get(..16).unwrap_or(&r.timestamp).replace('T', " ");
-                            ui.label(egui::RichText::new(ts).small().color(CLR_TEXT_DIM));
+                            if known_code && !is_friend {
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new("➕").color(egui::Color32::WHITE).strong(),
+                                        )
+                                        .fill(CLR_ACCENT)
+                                        .min_size(egui::vec2(30.0, 28.0)),
+                                    )
+                                    .on_hover_text("Добавить в друзья")
+                                    .clicked()
+                                {
+                                    action = Some(HistAction::AddFriend(r.peer_code.clone()));
+                                }
+                                ui.add_space(4.0);
+                            }
+                            if ui
+                                .add_enabled(
+                                    known_code,
+                                    egui::Button::new(
+                                        egui::RichText::new("💬").color(egui::Color32::WHITE).strong(),
+                                    )
+                                    .fill(CLR_BLUE)
+                                    .min_size(egui::vec2(30.0, 28.0)),
+                                )
+                                .on_hover_text(if known_code { "Написать" } else { "ID неизвестен (старая запись)" })
+                                .clicked()
+                            {
+                                action = Some(HistAction::Chat(r.peer_code.clone(), r.peer_name.clone()));
+                            }
+                            ui.add_space(4.0);
+                            if ui
+                                .add_enabled(
+                                    can_call,
+                                    egui::Button::new(
+                                        egui::RichText::new("📞").color(egui::Color32::WHITE).strong(),
+                                    )
+                                    .fill(if is_online { CLR_GREEN } else { CLR_SURFACE2 })
+                                    .min_size(egui::vec2(30.0, 28.0)),
+                                )
+                                .on_hover_text(if can_call {
+                                    "Перезвонить"
+                                } else if !known_code {
+                                    "ID неизвестен (старая запись)"
+                                } else {
+                                    "Собеседник не в сети"
+                                })
+                                .clicked()
+                            {
+                                action = Some(HistAction::Call(r.peer_code.clone(), r.peer_name.clone()));
+                            }
                         });
                     });
                 });
             ui.add_space(5.0);
         }
     });
+
+    match action {
+        Some(HistAction::Call(code, name)) => app.call_user(code, name),
+        Some(HistAction::Chat(code, name)) => app.open_chat(code, name),
+        Some(HistAction::AddFriend(code)) => app.send_friend_request(&code),
+        None => {}
+    }
 }
 
 // ─── Настройки ────────────────────────────────────────────────────────────────
 
 fn draw_settings(app: &mut App, ui: &mut egui::Ui) {
-    ui.add_space(12.0);
+    ui.add_space(8.0);
     ui.label(egui::RichText::new("Настройки").size(15.0).strong().color(CLR_TEXT));
-    ui.add_space(10.0);
+    ui.add_space(8.0);
 
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         settings_section(ui, "Профиль", |ui| {

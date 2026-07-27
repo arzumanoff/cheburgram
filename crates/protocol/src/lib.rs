@@ -41,6 +41,9 @@ pub struct TextMessage {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CallRecord {
     pub peer_name: String,
+    /// ID собеседника (для быстрых действий из истории; пусто у старых записей)
+    #[serde(default)]
+    pub peer_code: String,
     pub direction: CallDirection,
     pub timestamp: String,
     pub duration_secs: u64,

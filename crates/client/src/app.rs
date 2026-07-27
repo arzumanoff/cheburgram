@@ -39,7 +39,13 @@ pub enum CallState {
     None,
     Calling { target_code: String, target_name: String },
     IncomingCall { from_code: String, from_name: String, from_peer_id: u32 },
-    InCall { peer_id: u32, peer_name: String, call_id: u64, started_at: Instant },
+    InCall {
+        peer_id: u32,
+        peer_name: String,
+        peer_code: String,
+        call_id: u64,
+        started_at: Instant,
+    },
 }
 
 // ─── Аудио устройства (для UI) ────────────────────────────────────────────────
@@ -216,8 +222,8 @@ impl App {
     }
 
     pub fn send_friend_request(&mut self, code: &str) {
-        let clean = code.trim().to_string();
-        if clean.len() != 6 || !clean.chars().all(|c| c.is_ascii_digit()) {
+        let clean: String = code.chars().filter(|c| c.is_ascii_digit()).collect();
+        if clean.len() != 6 {
             self.status = "ID должен состоять из 6 цифр".into();
             return;
         }
@@ -252,6 +258,18 @@ impl App {
 
     // ── Чат ──
 
+    /// Открыть чат с пользователем по ID/имени (из любого места: контакты, история, звонок)
+    pub fn open_chat(&mut self, code: String, name: String) {
+        let canonical = self
+            .cfg
+            .friends
+            .iter()
+            .find(|f| f.user_code == code)
+            .cloned()
+            .unwrap_or(SavedFriend { user_code: code, name });
+        self.chat_active_friend = Some(canonical);
+    }
+
     pub fn send_text_message(&mut self, target_code: String, text: String) {
         let text_clean = text.trim().to_string();
         if text_clean.is_empty() {
@@ -277,6 +295,10 @@ impl App {
     // ── Звонки ──
 
     pub fn call_user(&mut self, target_code: String, target_name: String) {
+        if !matches!(self.call_state, CallState::None) {
+            return; // уже в звонке
+        }
+        self.chat_active_friend = None; // звонок важнее открытого чата
         self.call_start = Some(Instant::now());
         self.call_state = CallState::Calling {
             target_code: target_code.clone(),
@@ -292,9 +314,10 @@ impl App {
         self.status = format!("Соединение с {}...", from_name);
     }
 
-    pub fn reject_call(&mut self, from_peer_id: u32, from_name: &str) {
+    pub fn reject_call(&mut self, from_peer_id: u32) {
         self.send_msg(ControlMessage::CallReject { target_peer_id: from_peer_id });
-        self.push_history(from_name.to_string(), CallDirection::Missed, 0);
+        let (peer_name, peer_code) = self.current_call_peer();
+        self.push_history(peer_name, peer_code, CallDirection::Missed, 0);
         self.call_state = CallState::None;
         self.status = "Звонок отклонён".into();
     }
@@ -302,11 +325,13 @@ impl App {
     /// Завершение звонка по инициативе пользователя — трогает ТОЛЬКО аудио.
     /// Сетевой поток продолжает жить (главный баг v2 устранён).
     pub fn end_call(&mut self) {
-        let (peer_name, duration) = match &self.call_state {
-            CallState::InCall { peer_name, started_at, .. } => {
-                (peer_name.clone(), started_at.elapsed().as_secs())
+        let (peer_name, peer_code, duration) = match &self.call_state {
+            CallState::InCall { peer_name, peer_code, started_at, .. } => {
+                (peer_name.clone(), peer_code.clone(), started_at.elapsed().as_secs())
             }
-            CallState::Calling { target_name, .. } => (target_name.clone(), 0),
+            CallState::Calling { target_name, target_code } => {
+                (target_name.clone(), target_code.clone(), 0)
+            }
             _ => {
                 self.stop_audio();
                 self.call_state = CallState::None;
@@ -314,28 +339,52 @@ impl App {
             }
         };
         self.stop_audio();
-        self.push_history(peer_name, CallDirection::Outgoing, duration);
+        self.push_history(peer_name, peer_code, CallDirection::Outgoing, duration);
         self.send_msg(ControlMessage::CallEnd);
         self.call_state = CallState::None;
         self.status = "Звонок завершён".into();
     }
 
+    /// (имя, ID) текущего собеседника по состоянию звонка
+    fn current_call_peer(&self) -> (String, String) {
+        match &self.call_state {
+            CallState::InCall { peer_name, peer_code, .. } => {
+                (peer_name.clone(), peer_code.clone())
+            }
+            CallState::Calling { target_name, target_code } => {
+                (target_name.clone(), target_code.clone())
+            }
+            CallState::IncomingCall { from_name, from_code, .. } => {
+                (from_name.clone(), from_code.clone())
+            }
+            CallState::None => (String::new(), String::new()),
+        }
+    }
+
     /// Звонок завершён сервером/партнёром или обрывом связи
-    fn on_call_terminated(&mut self, peer_name: String, direction: CallDirection) {
+    fn on_call_terminated(&mut self, direction: CallDirection) {
+        let (peer_name, peer_code) = self.current_call_peer();
         let dur = self.call_start.map(|s| s.elapsed().as_secs()).unwrap_or(0);
-        let was_active = !matches!(self.call_state, CallState::None);
+        let was_active = !matches!(self.call_state, CallState::None) && !peer_name.is_empty();
         self.stop_audio();
         if was_active {
-            self.push_history(peer_name, direction, dur);
+            self.push_history(peer_name, peer_code, direction, dur);
         }
         self.call_state = CallState::None;
     }
 
-    fn push_history(&mut self, peer_name: String, direction: CallDirection, duration: u64) {
+    fn push_history(
+        &mut self,
+        peer_name: String,
+        peer_code: String,
+        direction: CallDirection,
+        duration: u64,
+    ) {
         self.cfg.call_history.insert(
             0,
             CallRecord {
                 peer_name,
+                peer_code,
                 direction,
                 timestamp: Utc::now().to_rfc3339(),
                 duration_secs: duration,
@@ -489,15 +538,7 @@ impl App {
                         self.status = "Нет связи с сервером. Повторная попытка...".into();
                     }
                     self.is_connected = false;
-                    if !matches!(self.call_state, CallState::None) {
-                        let name = match &self.call_state {
-                            CallState::InCall { peer_name, .. } => peer_name.clone(),
-                            CallState::Calling { target_name, .. } => target_name.clone(),
-                            CallState::IncomingCall { from_name, .. } => from_name.clone(),
-                            CallState::None => String::new(),
-                        };
-                        self.on_call_terminated(name, CallDirection::Missed);
-                    }
+                    self.on_call_terminated(CallDirection::Missed);
                 }
                 NetEvent::Msg(msg) => self.handle_server_msg(msg),
             }
@@ -523,15 +564,7 @@ impl App {
                 self.is_connected = false;
                 self.status =
                     "Этот аккаунт вошёл с другого устройства. Переподключение...".into();
-                if !matches!(self.call_state, CallState::None) {
-                    let name = match &self.call_state {
-                        CallState::InCall { peer_name, .. } => peer_name.clone(),
-                        CallState::Calling { target_name, .. } => target_name.clone(),
-                        CallState::IncomingCall { from_name, .. } => from_name.clone(),
-                        CallState::None => String::new(),
-                    };
-                    self.on_call_terminated(name, CallDirection::Missed);
-                }
+                self.on_call_terminated(CallDirection::Missed);
             }
             ControlMessage::VersionMismatch { min, max } => {
                 self.status = format!(
@@ -585,31 +618,45 @@ impl App {
                 }
             }
             ControlMessage::CallAccepted { peer_id, peer_name, call_id } => {
+                // ID собеседника берём из предыдущего состояния (Calling/IncomingCall),
+                // fallback — поиск по peer_id среди друзей
+                let peer_code = match &self.call_state {
+                    CallState::Calling { target_code, .. } => target_code.clone(),
+                    CallState::IncomingCall { from_code, .. } => from_code.clone(),
+                    _ => self
+                        .friend_statuses
+                        .iter()
+                        .find(|(_, f)| f.peer_id == Some(peer_id))
+                        .map(|(c, _)| c.clone())
+                        .unwrap_or_default(),
+                };
                 self.start_audio(call_id);
                 let started = self.call_start.unwrap_or_else(Instant::now);
                 self.call_state = CallState::InCall {
                     peer_id,
                     peer_name: peer_name.clone(),
+                    peer_code,
                     call_id,
                     started_at: started,
                 };
                 self.status = format!("В разговоре с {}", peer_name);
             }
             ControlMessage::CallRejected { peer_name, .. } => {
+                let (_, peer_code) = self.current_call_peer();
                 self.call_state = CallState::None;
                 self.status = format!("{} недоступен(на)", peer_name);
-                self.push_history(peer_name, CallDirection::Outgoing, 0);
+                self.push_history(peer_name, peer_code, CallDirection::Outgoing, 0);
             }
             ControlMessage::CallEnded { peer_name } => {
                 let dir = match &self.call_state {
                     CallState::InCall { .. } => CallDirection::Incoming,
                     _ => CallDirection::Missed,
                 };
-                self.on_call_terminated(peer_name.clone(), dir);
+                self.on_call_terminated(dir);
                 self.status = format!("{} завершил(а) звонок", peer_name);
             }
-            ControlMessage::CallMissed { peer_name } => {
-                self.on_call_terminated(peer_name, CallDirection::Missed);
+            ControlMessage::CallMissed { peer_name: _ } => {
+                self.on_call_terminated(CallDirection::Missed);
                 self.status = "Пропущенный звонок".into();
             }
             ControlMessage::Error { message } => {
