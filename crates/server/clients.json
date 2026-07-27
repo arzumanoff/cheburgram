@@ -3,16 +3,14 @@
     "111111": {
       "client_id": "uuid-alice",
       "name": "Алиса",
-      "last_seen": "2026-07-27T17:41:12.333222+00:00"
+      "last_seen": "2026-07-27T17:42:33.653781600+00:00"
     },
     "222222": {
       "client_id": "uuid-bob",
       "name": "Боб",
-      "last_seen": "2026-07-27T17:41:12.395662900+00:00"
+      "last_seen": "2026-07-27T17:42:33.654690300+00:00"
     }
   },
-  "pending_requests": {
-    "222222": []
-  },
+  "pending_requests": {},
   "pending_messages": {}
 }
