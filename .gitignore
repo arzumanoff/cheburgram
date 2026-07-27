@@ -2,6 +2,9 @@
 /target/
 **/*.rs.bk
 
+# Cargo.lock не коммитим — генерируется при сборке (локально и в Docker)
+/Cargo.lock
+
 # Данные сервера (реестр пользователей) — НЕ коммитить!
 clients.json
 clients.json.tmp

@@ -3,8 +3,11 @@ FROM rust:alpine AS builder
 RUN apk add --no-cache musl-dev
 
 WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
 COPY crates ./crates
+
+# Лок-файл не храним в репо — генерируем при сборке
+RUN cargo generate-lockfile
 
 # Собираем исключительно бинарник сервера (audiopus/GUI не нужны)
 RUN cargo build --release --package cheburgram-server
