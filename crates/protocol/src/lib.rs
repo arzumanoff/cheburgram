@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-/// Информация о пользователе
+/// Статус друга
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserInfo {
-    pub peer_id: u32,
+pub struct FriendStatus {
+    pub user_code: String,
     pub name: String,
+    pub is_online: bool,
+    pub peer_id: Option<u32>,
 }
 
 /// Запись о звонке (для истории)
@@ -16,7 +18,7 @@ pub struct CallRecord {
     pub duration_secs: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum CallDirection {
     Incoming,
     Outgoing,
@@ -27,64 +29,80 @@ pub enum CallDirection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlMessage {
     // === Регистрация ===
-    /// Клиент регистрируется: client_id = UUID (постоянный), name = отображаемое имя
+    /// Клиент регистрируется с постоянными client_id, user_code (6 цифр) и отображаемым именем
     Register {
         client_id: String,
+        user_code: String,
         name: String,
     },
     /// Сервер подтверждает регистрацию
     Registered {
         peer_id: u32,
+        user_code: String,
         udp_port: u16,
     },
 
-    // === Присутствие (онлайн/офлайн) ===
-    /// Полный список пользователей (отправляется при входе)
-    UserList {
-        users: Vec<UserInfo>,
+    // === Друзья и Поиск ===
+    /// Поиск пользователя по 6-значному ID
+    LookupUser {
+        user_code: String,
     },
-    /// Новый пользователь появился онлайн
-    UserOnline {
-        peer_id: u32,
+    /// Результат поиска
+    UserLookupResult {
+        found: bool,
+        user_code: String,
         name: String,
+        is_online: bool,
+        peer_id: Option<u32>,
     },
-    /// Пользователь ушёл офлайн
-    UserOffline {
-        peer_id: u32,
-        name: String,
+    /// Запрос статуса списка друзей
+    GetFriendsStatus {
+        user_codes: Vec<String>,
+    },
+    /// Ответ со статусом друзей
+    FriendsStatus {
+        friends: Vec<FriendStatus>,
+    },
+
+    // === Уведомления присутствия ===
+    UserStatusChanged {
+        user_code: String,
+        is_online: bool,
+        peer_id: Option<u32>,
     },
 
     // === Звонки ===
-    /// Исходящий запрос на звонок (клиент → сервер, сервер → цель)
+    /// Исходящий звонок по user_code или peer_id
     CallRequest {
-        to_id: u32,
+        target_code: String,
     },
-    /// Сервер уведомляет цель о входящем звонке
+    /// Входящий звонок целевому клиенту
     IncomingCall {
-        from_id: u32,
+        from_code: String,
         from_name: String,
+        from_peer_id: u32,
     },
-    /// Цель принимает звонок
+    /// Принять звонок
     CallAccept {
-        to_id: u32,
+        target_peer_id: u32,
     },
-    /// Сервер уведомляет инициатора что звонок принят
+    /// Звонок принят
     CallAccepted {
         peer_id: u32,
         peer_name: String,
     },
-    /// Звонок отклонён
+    /// Отклонить звонок
     CallReject {
-        to_id: u32,
+        target_peer_id: u32,
     },
-    /// Сервер уведомляет инициатора что звонок отклонён
+    /// Звонок отклонён
     CallRejected {
         peer_id: u32,
         peer_name: String,
     },
-    /// Завершить активный звонок (любой участник)
+    /// Завершить звонок
     CallEnd,
-    /// Уведомление что звонок завершён другой стороной
+    /// Уведомление о завершении звонка
     CallEnded {
         peer_name: String,
     },
@@ -100,7 +118,7 @@ pub enum ControlMessage {
 /// UDP аудио пакет
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioPacketHeader {
-    pub room_id: u64,   // уникальный ID сессии звонка
+    pub room_id: u64,
     pub sender_id: u32,
     pub sequence: u64,
 }
@@ -108,7 +126,7 @@ pub struct AudioPacketHeader {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioPacket {
     pub header: AudioPacketHeader,
-    pub payload: Vec<u8>, // Opus-сжатый фрейм (пустой = ping-регистрация)
+    pub payload: Vec<u8>,
 }
 
 impl AudioPacket {

@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use anyhow::{anyhow, Result};
-use cheburgram_protocol::{AudioPacket, CallDirection, CallRecord, ControlMessage, UserInfo};
+use cheburgram_protocol::{
+    AudioPacket, CallDirection, CallRecord, ControlMessage, FriendStatus,
+};
 use chrono::Utc;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
@@ -22,11 +24,11 @@ use std::{
     time::{Duration, Instant},
 };
 use tracing::{error, info};
-use uuid::Uuid;
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
+use uuid::Uuid;
 
 const SAMPLE_RATE: u32 = 48000;
 const FRAME_SIZE: usize = 960;
@@ -37,34 +39,48 @@ const CLR_BG: egui::Color32 = egui::Color32::from_rgb(13, 17, 23);
 const CLR_SURFACE: egui::Color32 = egui::Color32::from_rgb(22, 27, 34);
 const CLR_SURFACE2: egui::Color32 = egui::Color32::from_rgb(30, 37, 46);
 const CLR_ACCENT: egui::Color32 = egui::Color32::from_rgb(255, 140, 0);
-const CLR_ACCENT_DIM: egui::Color32 = egui::Color32::from_rgb(80, 44, 0);
 const CLR_GREEN: egui::Color32 = egui::Color32::from_rgb(35, 197, 94);
 const CLR_RED: egui::Color32 = egui::Color32::from_rgb(218, 54, 51);
 const CLR_BLUE: egui::Color32 = egui::Color32::from_rgb(88, 166, 255);
 const CLR_TEXT: egui::Color32 = egui::Color32::from_rgb(230, 237, 243);
-const CLR_TEXT_DIM: egui::Color32 = egui::Color32::from_rgb(125, 133, 144);
+const CLR_TEXT_DIM: egui::Color32 = egui::Color32::from_rgb(139, 148, 158);
 const CLR_BORDER: egui::Color32 = egui::Color32::from_rgb(48, 54, 61);
 
-// ─── Конфиг ──────────────────────────────────────────────────────────────────
+// ─── Сохранённый друг ────────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+struct SavedFriend {
+    user_code: String,
+    name: String,
+}
+
+// ─── Конфигурация (%APPDATA%\Cheburgram\config.json) ──────────────────────────
 
 #[derive(Serialize, Deserialize, Clone)]
 struct AppConfig {
     client_id: String,
+    user_code: String,
     display_name: String,
     server_address: String,
     selected_input: usize,
     selected_output: usize,
+    friends: Vec<SavedFriend>,
     call_history: Vec<CallRecord>,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let code = format!("{:06}", rng.gen_range(100_000..999_999));
         Self {
             client_id: Uuid::new_v4().to_string(),
+            user_code: code,
             display_name: String::new(),
             server_address: DEFAULT_SERVER.to_string(),
             selected_input: 0,
             selected_output: 0,
+            friends: Vec::new(),
             call_history: Vec::new(),
         }
     }
@@ -101,17 +117,21 @@ fn save_config(c: &AppConfig) {
     }
 }
 
-// ─── Состояния ───────────────────────────────────────────────────────────────
+// ─── Вкладки / Экраны ─────────────────────────────────────────────────────────
 
-#[derive(PartialEq, Clone)]
-enum Screen {
-    Login,
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum Tab {
     Contacts,
-    Calling { to_id: u32, to_name: String },
-    IncomingCall { from_id: u32, from_name: String },
-    InCall { peer_id: u32, peer_name: String, call_id: u64, started_at: Instant },
     History,
     Settings,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+enum CallState {
+    None,
+    Calling { target_code: String, target_name: String },
+    IncomingCall { from_code: String, from_name: String, from_peer_id: u32 },
+    InCall { peer_id: u32, peer_name: String, call_id: u64, started_at: Instant },
 }
 
 // ─── Аудио устройства ────────────────────────────────────────────────────────
@@ -136,20 +156,26 @@ fn list_audio_devs() -> AudioDevs {
     AudioDevs { inputs: ins, outputs: outs, sel_in: 0, sel_out: 0 }
 }
 
-// ─── Приложение ──────────────────────────────────────────────────────────────
+// ─── Главное приложение ───────────────────────────────────────────────────────
 
 struct App {
     cfg: AppConfig,
-    screen: Screen,
+    active_tab: Tab,
+    call_state: CallState,
     status: String,
+    is_connected: bool,
 
     name_input: String,
-    contacts: Vec<UserInfo>,
+    add_friend_input: String,
+    copied_code_banner: bool,
+
+    // Онлайн статус сохранённых друзей (user_code -> FriendStatus)
+    friend_statuses: std::collections::HashMap<String, FriendStatus>,
     my_peer_id: Option<u32>,
 
     event_rx: Option<Receiver<ControlMessage>>,
     stop: Arc<AtomicBool>,
-    tcp_writer: Option<Arc<Mutex<std::net::TcpStream>>>,
+    tcp_writer: Option<Arc<Mutex<StdTcpStream>>>,
 
     devs: AudioDevs,
     mic_level: Arc<AtomicU8>,
@@ -161,17 +187,16 @@ struct App {
     call_id_a: Arc<AtomicU64>,
     call_start: Option<Instant>,
 
-    // Тест микрофона в настройках
+    // Тест микрофона
     mic_test_level: Arc<AtomicU8>,
     mic_test_stop: Arc<AtomicBool>,
     mic_test_active: bool,
 
-    // Трей и закрытие
+    // Трей
     show_close_dialog: bool,
     _tray_icon: Option<TrayIcon>,
     tray_open_id: Option<tray_icon::menu::MenuId>,
     tray_quit_id: Option<tray_icon::menu::MenuId>,
-    window_visible: bool,
 }
 
 impl Default for App {
@@ -182,11 +207,17 @@ impl Default for App {
         devs.sel_in = cfg.selected_input.min(devs.inputs.len().saturating_sub(1));
         devs.sel_out = cfg.selected_output.min(devs.outputs.len().saturating_sub(1));
         let (tray_icon, open_id, quit_id) = create_tray_icon().map(|(t, o, q)| (Some(t), Some(o), Some(q))).unwrap_or((None, None, None));
+
         Self {
-            screen: Screen::Login,
+            cfg,
+            active_tab: Tab::Contacts,
+            call_state: CallState::None,
             status: String::new(),
+            is_connected: false,
             name_input,
-            contacts: Vec::new(),
+            add_friend_input: String::new(),
+            copied_code_banner: false,
+            friend_statuses: std::collections::HashMap::new(),
             my_peer_id: None,
             event_rx: None,
             stop: Arc::new(AtomicBool::new(false)),
@@ -207,62 +238,12 @@ impl Default for App {
             _tray_icon: tray_icon,
             tray_open_id: open_id,
             tray_quit_id: quit_id,
-            window_visible: true,
-            cfg,
-        }
-    }
-}
-
-// ─── Трей и автозагрузка ─────────────────────────────────────────────────────
-
-fn create_tray_icon() -> Option<(TrayIcon, tray_icon::menu::MenuId, tray_icon::menu::MenuId)> {
-    let rgba = make_icon_rgba();
-    let icon = tray_icon::Icon::from_rgba(rgba, 32, 32).ok()?;
-
-    let open = MenuItem::new("Открыть Cheburgram", true, None);
-    let quit = MenuItem::new("Выйти", true, None);
-    let open_id = open.id().clone();
-    let quit_id = quit.id().clone();
-
-    let menu = Menu::new();
-    let _ = menu.append(&open);
-    let _ = menu.append(&PredefinedMenuItem::separator());
-    let _ = menu.append(&quit);
-
-    let tray = TrayIconBuilder::new()
-        .with_icon(icon)
-        .with_tooltip("Cheburgram — голосовой мессенджер")
-        .with_menu(Box::new(menu))
-        .build()
-        .ok()?;
-
-    Some((tray, open_id, quit_id))
-}
-
-fn setup_autostart() {
-    #[cfg(target_os = "windows")]
-    {
-        use winreg::enums::*;
-        use winreg::RegKey;
-        if let Ok(exe) = std::env::current_exe() {
-            let exe_str = exe.to_string_lossy().to_string();
-            let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-            if let Ok(run) = hkcu.open_subkey_with_flags(
-                "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-                KEY_WRITE,
-            ) {
-                let _ = run.set_value("Cheburgram", &exe_str);
-                info!("Автозагрузка добавлена: {}", exe_str);
-            } else if let Ok((run, _)) = hkcu
-                .create_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
-            {
-                let _ = run.set_value("Cheburgram", &exe_str);
-            }
         }
     }
 }
 
 impl App {
+    /// Отправка команды серверу строго через ЕДИНЫЙ активный TCP поток
     fn send_msg(&self, msg: ControlMessage) {
         if let Some(w) = &self.tcp_writer {
             if let Ok(mut stream) = w.lock() {
@@ -290,30 +271,35 @@ impl App {
         self.event_rx = Some(rx);
 
         let client_id = self.cfg.client_id.clone();
+        let user_code = self.cfg.user_code.clone();
         let stop = self.stop.clone();
 
         let stream = match StdTcpStream::connect(&addr) {
             Ok(s) => s,
             Err(e) => {
                 self.status = format!("Ошибка подключения: {}", e);
+                self.is_connected = false;
                 return;
             }
         };
 
-        // Сохраняем writer для отправки команд
         let writer = Arc::new(Mutex::new(stream.try_clone().unwrap()));
         self.tcp_writer = Some(writer.clone());
 
-        // Отправляем Register сразу
+        // Отправляем Register
         {
             let mut w = writer.lock().unwrap();
-            let msg = ControlMessage::Register { client_id, name };
+            let msg = ControlMessage::Register {
+                client_id,
+                user_code,
+                name,
+            };
             if let Ok(json) = serde_json::to_string(&msg) {
                 let _ = w.write_all(format!("{}\n", json).as_bytes());
             }
         }
 
-        // Читаем ответы
+        // Читаем ответы в фоне
         thread::spawn(move || {
             let mut reader = BufReader::new(stream);
             let mut line = String::new();
@@ -322,7 +308,7 @@ impl App {
                 match reader.read_line(&mut line) {
                     Ok(0) | Err(_) => {
                         let _ = tx.send(ControlMessage::Error {
-                            message: "Соединение разорвано".into(),
+                            message: "Соединение с сервером разорвано".into(),
                         });
                         break;
                     }
@@ -336,21 +322,50 @@ impl App {
         });
     }
 
-    fn call_user(&mut self, to_id: u32, to_name: String) {
-        self.call_start = Some(Instant::now());
-        self.screen = Screen::Calling { to_id, to_name: to_name.clone() };
-        self.status = format!("Вызов {}...", to_name);
-        self.send_msg(ControlMessage::CallRequest { to_id });
+    fn request_friends_status(&self) {
+        let codes: Vec<String> = self.cfg.friends.iter().map(|f| f.user_code.clone()).collect();
+        if !codes.is_empty() {
+            self.send_msg(ControlMessage::GetFriendsStatus { user_codes: codes });
+        }
     }
 
-    fn accept_call(&mut self, from_id: u32, from_name: String) {
-        self.call_start = Some(Instant::now());
-        self.send_msg(ControlMessage::CallAccept { to_id: from_id });
-        self.status = format!("Соединяемся с {}...", from_name);
+    fn add_friend_by_code(&mut self, code: &str) {
+        let clean = code.trim().to_string();
+        if clean.len() != 6 || !clean.chars().all(|c| c.is_ascii_digit()) {
+            self.status = "ID должен состоять из 6 цифр".into();
+            return;
+        }
+        if clean == self.cfg.user_code {
+            self.status = "Нельзя добавить свой собственный ID".into();
+            return;
+        }
+        if self.cfg.friends.iter().any(|f| f.user_code == clean) {
+            self.status = "Этот контакт уже у вас в друзьях".into();
+            return;
+        }
+
+        self.status = format!("Поиск ID {}...", clean);
+        self.send_msg(ControlMessage::LookupUser { user_code: clean });
     }
 
-    fn reject_call(&mut self, from_id: u32, from_name: &str) {
-        self.send_msg(ControlMessage::CallReject { to_id: from_id });
+    fn call_user(&mut self, target_code: String, target_name: String) {
+        self.call_start = Some(Instant::now());
+        self.call_state = CallState::Calling {
+            target_code: target_code.clone(),
+            target_name: target_name.clone(),
+        };
+        self.status = format!("Вызов {}...", target_name);
+        self.send_msg(ControlMessage::CallRequest { target_code });
+    }
+
+    fn accept_call(&mut self, from_peer_id: u32, from_name: String) {
+        self.call_start = Some(Instant::now());
+        self.send_msg(ControlMessage::CallAccept { target_peer_id: from_peer_id });
+        self.status = format!("Соединение с {}...", from_name);
+    }
+
+    fn reject_call(&mut self, from_peer_id: u32, from_name: &str) {
+        self.send_msg(ControlMessage::CallReject { target_peer_id: from_peer_id });
         self.cfg.call_history.insert(0, CallRecord {
             peer_name: from_name.to_string(),
             direction: CallDirection::Missed,
@@ -358,7 +373,7 @@ impl App {
             duration_secs: 0,
         });
         save_config(&self.cfg);
-        self.screen = Screen::Contacts;
+        self.call_state = CallState::None;
         self.status = "Звонок отклонён".into();
     }
 
@@ -366,12 +381,12 @@ impl App {
         self.stop.store(true, Ordering::SeqCst);
         self.udp_sock = None;
 
-        let (peer_name, duration) = match &self.screen {
-            Screen::InCall { peer_name, started_at, .. } => {
+        let (peer_name, duration) = match &self.call_state {
+            CallState::InCall { peer_name, started_at, .. } => {
                 (peer_name.clone(), started_at.elapsed().as_secs())
             }
-            Screen::Calling { to_name, .. } => (to_name.clone(), 0),
-            _ => { self.screen = Screen::Contacts; return; }
+            CallState::Calling { target_name, .. } => (target_name.clone(), 0),
+            _ => { self.call_state = CallState::None; return; }
         };
 
         self.cfg.call_history.insert(0, CallRecord {
@@ -383,7 +398,7 @@ impl App {
         if self.cfg.call_history.len() > 50 { self.cfg.call_history.truncate(50); }
         save_config(&self.cfg);
         self.send_msg(ControlMessage::CallEnd);
-        self.screen = Screen::Contacts;
+        self.call_state = CallState::None;
         self.status = "Звонок завершён".into();
         self.mic_level.store(0, Ordering::Relaxed);
         self.pkts_sent.store(0, Ordering::Relaxed);
@@ -396,7 +411,7 @@ impl App {
 
         let sock = match StdUdpSocket::bind("0.0.0.0:0") {
             Ok(s) => Arc::new(s),
-            Err(e) => { self.status = format!("UDP: {}", e); return; }
+            Err(e) => { self.status = format!("UDP ошибка: {}", e); return; }
         };
 
         let target: SocketAddr = format!("{}:{}", server_ip, udp_port)
@@ -408,35 +423,47 @@ impl App {
 
         let my_id = self.my_peer_id.unwrap_or(0);
 
-        // UDP keepalive / регистрация
-        { let s = sock.clone(); let st = self.stop.clone();
-          thread::spawn(move || {
-              while !st.load(Ordering::Relaxed) {
-                  let p = AudioPacket::new(call_id, my_id, 0, vec![]);
-                  if let Ok(b) = p.to_bytes() { let _ = s.send_to(&b, target); }
-                  thread::sleep(Duration::from_secs(2));
-              }
-          }); }
+        // UDP keepalive
+        {
+            let s = sock.clone();
+            let st = self.stop.clone();
+            thread::spawn(move || {
+                while !st.load(Ordering::Relaxed) {
+                    let p = AudioPacket::new(call_id, my_id, 0, vec![]);
+                    if let Ok(b) = p.to_bytes() { let _ = s.send_to(&b, target); }
+                    thread::sleep(Duration::from_secs(2));
+                }
+            });
+        }
 
         // Микрофон
         let in_dev = self.devs.inputs.get(self.devs.sel_in).cloned().unwrap_or_default();
-        { let s = sock.clone(); let st = self.stop.clone();
-          let lv = self.mic_level.clone(); let sn = self.pkts_sent.clone(); let m = self.mic_muted;
-          thread::spawn(move || {
-              if let Err(e) = audio_in(in_dev, s, target, call_id, my_id, st, lv, sn, m) {
-                  error!("Микрофон: {:?}", e);
-              }
-          }); }
+        {
+            let s = sock.clone();
+            let st = self.stop.clone();
+            let lv = self.mic_level.clone();
+            let sn = self.pkts_sent.clone();
+            let m = self.mic_muted;
+            thread::spawn(move || {
+                if let Err(e) = audio_in(in_dev, s, target, call_id, my_id, st, lv, sn, m) {
+                    error!("Микрофон: {:?}", e);
+                }
+            });
+        }
 
         // Вывод
         let out_dev = self.devs.outputs.get(self.devs.sel_out).cloned().unwrap_or_default();
-        { let s = sock.clone(); let st = self.stop.clone();
-          let rc = self.pkts_recv.clone(); let ca = self.call_id_a.clone();
-          thread::spawn(move || {
-              if let Err(e) = audio_out(out_dev, s, st, rc, ca) {
-                  error!("Вывод: {:?}", e);
-              }
-          }); }
+        {
+            let s = sock.clone();
+            let st = self.stop.clone();
+            let rc = self.pkts_recv.clone();
+            let ca = self.call_id_a.clone();
+            thread::spawn(move || {
+                if let Err(e) = audio_out(out_dev, s, st, rc, ca) {
+                    error!("Вывод: {:?}", e);
+                }
+            });
+        }
     }
 
     fn start_mic_test(&mut self) {
@@ -503,39 +530,73 @@ impl App {
         }
         for msg in evs {
             match msg {
-                ControlMessage::Registered { peer_id, udp_port: _ } => {
+                ControlMessage::Registered { peer_id, user_code, udp_port: _ } => {
                     self.my_peer_id = Some(peer_id);
-                    self.screen = Screen::Contacts;
-                    self.status = format!("Онлайн — {}", self.cfg.display_name);
+                    self.cfg.user_code = user_code.clone();
+                    save_config(&self.cfg);
+                    self.is_connected = true;
+                    self.status = format!("В сети как {} (ID: {})", self.cfg.display_name, user_code);
+                    self.request_friends_status();
                 }
-                ControlMessage::UserList { users } => {
-                    let me = self.my_peer_id;
-                    self.contacts = users.into_iter().filter(|u| Some(u.peer_id) != me).collect();
-                }
-                ControlMessage::UserOnline { peer_id, name } => {
-                    if Some(peer_id) != self.my_peer_id && !self.contacts.iter().any(|c| c.peer_id == peer_id) {
-                        self.contacts.push(UserInfo { peer_id, name });
+                ControlMessage::UserLookupResult { found, user_code, name, is_online, peer_id } => {
+                    if found {
+                        let friend = SavedFriend { user_code: user_code.clone(), name: name.clone() };
+                        if !self.cfg.friends.contains(&friend) {
+                            self.cfg.friends.push(friend);
+                            save_config(&self.cfg);
+                        }
+                        self.friend_statuses.insert(user_code.clone(), FriendStatus {
+                            user_code: user_code.clone(),
+                            name,
+                            is_online,
+                            peer_id,
+                        });
+                        self.add_friend_input.clear();
+                        self.status = format!("Контакт ID {} добавлен!", user_code);
+                    } else {
+                        self.status = format!("Пользователь с ID {} не найден", user_code);
                     }
                 }
-                ControlMessage::UserOffline { peer_id, .. } => {
-                    self.contacts.retain(|c| c.peer_id != peer_id);
+                ControlMessage::FriendsStatus { friends } => {
+                    for f in friends {
+                        self.friend_statuses.insert(f.user_code.clone(), f);
+                    }
                 }
-                ControlMessage::IncomingCall { from_id, from_name } => {
-                    self.screen = Screen::IncomingCall { from_id, from_name };
+                ControlMessage::UserStatusChanged { user_code, is_online, peer_id } => {
+                    if let Some(f) = self.friend_statuses.get_mut(&user_code) {
+                        f.is_online = is_online;
+                        f.peer_id = peer_id;
+                    } else if self.cfg.friends.iter().any(|friend| friend.user_code == user_code) {
+                        self.request_friends_status();
+                    }
+                }
+                ControlMessage::IncomingCall { from_code, from_name, from_peer_id } => {
+                    self.call_state = CallState::IncomingCall {
+                        from_code,
+                        from_name,
+                        from_peer_id,
+                    };
                 }
                 ControlMessage::CallAccepted { peer_id, peer_name } => {
                     let call_id = time_micros();
                     self.start_audio(peer_id, 7879, call_id);
                     let started = self.call_start.unwrap_or_else(Instant::now);
-                    self.screen = Screen::InCall { peer_id, peer_name: peer_name.clone(), call_id, started_at: started };
+                    self.call_state = CallState::InCall {
+                        peer_id,
+                        peer_name: peer_name.clone(),
+                        call_id,
+                        started_at: started,
+                    };
                     self.status = format!("В разговоре с {}", peer_name);
                 }
                 ControlMessage::CallRejected { peer_name, .. } => {
-                    self.screen = Screen::Contacts;
-                    self.status = format!("{} недоступен", peer_name);
+                    self.call_state = CallState::None;
+                    self.status = format!("{} недоступен(на)", peer_name);
                     self.cfg.call_history.insert(0, CallRecord {
-                        peer_name, direction: CallDirection::Outgoing,
-                        timestamp: Utc::now().to_rfc3339(), duration_secs: 0,
+                        peer_name,
+                        direction: CallDirection::Outgoing,
+                        timestamp: Utc::now().to_rfc3339(),
+                        duration_secs: 0,
                     });
                     save_config(&self.cfg);
                 }
@@ -544,18 +605,20 @@ impl App {
                     self.udp_sock = None;
                     let dur = self.call_start.map(|s| s.elapsed().as_secs()).unwrap_or(0);
                     self.cfg.call_history.insert(0, CallRecord {
-                        peer_name: peer_name.clone(), direction: CallDirection::Incoming,
-                        timestamp: Utc::now().to_rfc3339(), duration_secs: dur,
+                        peer_name: peer_name.clone(),
+                        direction: CallDirection::Incoming,
+                        timestamp: Utc::now().to_rfc3339(),
+                        duration_secs: dur,
                     });
                     if self.cfg.call_history.len() > 50 { self.cfg.call_history.truncate(50); }
                     save_config(&self.cfg);
-                    self.screen = Screen::Contacts;
-                    self.status = format!("{} завершил звонок", peer_name);
+                    self.call_state = CallState::None;
+                    self.status = format!("{} завершил(а) звонок", peer_name);
                 }
                 ControlMessage::Error { message } => {
-                    self.status = format!("Ошибка: {}", message);
-                    if matches!(self.screen, Screen::Calling { .. }) {
-                        self.screen = Screen::Contacts;
+                    self.status = format!("⚠ {}", message);
+                    if matches!(self.call_state, CallState::Calling { .. }) {
+                        self.call_state = CallState::None;
                     }
                 }
                 _ => {}
@@ -575,6 +638,52 @@ fn normalize(s: &str) -> String {
     if s.ends_with(":22") { return format!("{}:7878", s.trim_end_matches(":22")); }
     if !s.contains(':') { return format!("{}:7878", s); }
     s.to_string()
+}
+
+// ─── Трей и автозагрузка ─────────────────────────────────────────────────────
+
+fn create_tray_icon() -> Option<(TrayIcon, tray_icon::menu::MenuId, tray_icon::menu::MenuId)> {
+    let rgba = make_icon_rgba();
+    let icon = tray_icon::Icon::from_rgba(rgba, 32, 32).ok()?;
+
+    let open = MenuItem::new("Открыть Cheburgram", true, None);
+    let quit = MenuItem::new("Выйти", true, None);
+    let open_id = open.id().clone();
+    let quit_id = quit.id().clone();
+
+    let menu = Menu::new();
+    let _ = menu.append(&open);
+    let _ = menu.append(&PredefinedMenuItem::separator());
+    let _ = menu.append(&quit);
+
+    let tray = TrayIconBuilder::new()
+        .with_icon(icon)
+        .with_tooltip("Cheburgram — голосовой мессенджер")
+        .with_menu(Box::new(menu))
+        .build()
+        .ok()?;
+
+    Some((tray, open_id, quit_id))
+}
+
+fn setup_autostart() {
+    #[cfg(target_os = "windows")]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+        if let Ok(exe) = std::env::current_exe() {
+            let exe_str = exe.to_string_lossy().to_string();
+            let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+            if let Ok(run) = hkcu.open_subkey_with_flags(
+                "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                KEY_WRITE,
+            ) {
+                let _ = run.set_value("Cheburgram", &exe_str);
+            } else if let Ok((run, _)) = hkcu.create_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run") {
+                let _ = run.set_value("Cheburgram", &exe_str);
+            }
+        }
+    }
 }
 
 // ─── Аудио ───────────────────────────────────────────────────────────────────
@@ -702,7 +811,6 @@ impl eframe::App for App {
                             egui::RichText::new("Свернуть в трей").color(egui::Color32::WHITE).strong()
                         ).fill(CLR_ACCENT).min_size(egui::vec2(140.0, 36.0))).clicked() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                            self.window_visible = false;
                             self.show_close_dialog = false;
                         }
                         ui.add_space(8.0);
@@ -723,110 +831,133 @@ impl eframe::App for App {
         }
 
         // ── Трей события ──────────────────────────────────────────────────
-        // Двойной клик по иконке — показать окно
         if let Ok(_ev) = TrayIconEvent::receiver().try_recv() {
-            // Любой клик по иконке — показать окно
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            self.window_visible = true;
         }
-        // Клик по меню трея
         if let Ok(ev) = MenuEvent::receiver().try_recv() {
             let is_open = self.tray_open_id.as_ref().map(|id| *id == ev.id).unwrap_or(false);
             let is_quit = self.tray_quit_id.as_ref().map(|id| *id == ev.id).unwrap_or(false);
             if is_open {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                self.window_visible = true;
             } else if is_quit {
                 std::process::exit(0);
             }
         }
 
-        let screen = self.screen.clone();
-
-
+        // Глобальная тема
         let mut vis = egui::Visuals::dark();
         vis.panel_fill = CLR_BG;
         vis.window_fill = CLR_SURFACE;
         vis.window_rounding = egui::Rounding::same(10.0);
         vis.widgets.noninteractive.bg_fill = CLR_SURFACE;
         vis.widgets.inactive.bg_fill = CLR_SURFACE2;
-        vis.widgets.hovered.bg_fill = egui::Color32::from_rgb(48, 56, 70);
-        vis.widgets.active.bg_fill = egui::Color32::from_rgb(60, 70, 90);
+        vis.widgets.hovered.bg_fill = egui::Color32::from_rgb(40, 48, 60);
+        vis.widgets.active.bg_fill = egui::Color32::from_rgb(50, 60, 75);
         vis.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, CLR_TEXT_DIM);
         vis.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, CLR_TEXT);
         vis.extreme_bg_color = egui::Color32::from_rgb(10, 14, 20);
         ctx.set_visuals(vis);
 
-        // Стиль
         let mut style = (*ctx.style()).clone();
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        style.spacing.button_padding = egui::vec2(12.0, 8.0);
-        style.visuals.widgets.noninteractive.rounding = egui::Rounding::same(6.0);
-        style.visuals.widgets.inactive.rounding = egui::Rounding::same(6.0);
+        style.spacing.button_padding = egui::vec2(10.0, 6.0);
         ctx.set_style(style);
 
-        let screen = self.screen.clone();
-
-        // Верхняя панель (не для логина)
-        if screen != Screen::Login {
-            egui::TopBottomPanel::top("topbar")
-                .frame(egui::Frame::none().fill(CLR_SURFACE).inner_margin(egui::Margin::symmetric(12.0, 8.0)))
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        // Лого
-                        draw_chebu_icon(ui, 28.0);
-                        ui.add_space(6.0);
-                        ui.label(egui::RichText::new("Cheburgram").size(15.0).strong().color(CLR_ACCENT));
-
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let is_settings = screen == Screen::Settings;
-                            let is_history = screen == Screen::History;
-
-                            if icon_btn(ui, "Настройки", is_settings, |ui| {
-                                gear_icon(ui, 16.0, if is_settings { CLR_ACCENT } else { CLR_TEXT_DIM });
-                            }) {
-                                self.screen = if is_settings { Screen::Contacts } else { Screen::Settings };
-                            }
-
-                            ui.add_space(4.0);
-
-                            if icon_btn(ui, "История", is_history, |ui| {
-                                clock_icon(ui, 16.0, if is_history { CLR_ACCENT } else { CLR_TEXT_DIM });
-                            }) {
-                                self.screen = if is_history { Screen::Contacts } else { Screen::History };
-                            }
-                        });
-                    });
-                });
+        // Если не авторизован (имя пустое) — экран входа
+        if !self.is_connected && self.cfg.display_name.is_empty() {
+            egui::CentralPanel::default().frame(egui::Frame::none().fill(CLR_BG)).show(ctx, |ui| {
+                self.draw_login(ui, ctx);
+            });
+            ctx.request_repaint_after(Duration::from_millis(50));
+            return;
         }
+
+        // Авто-подключение если имя есть, но ещё не подключены
+        if !self.is_connected && self.event_rx.is_none() {
+            self.connect_register();
+        }
+
+        // Если идёт активный звонок / исходящий / входящий — показываем экран звонка
+        match self.call_state.clone() {
+            CallState::Calling { target_code: _, target_name } => {
+                egui::CentralPanel::default().frame(egui::Frame::none().fill(CLR_BG)).show(ctx, |ui| {
+                    self.draw_calling(ui, ctx, &target_name);
+                });
+                ctx.request_repaint_after(Duration::from_millis(50));
+                return;
+            }
+            CallState::IncomingCall { from_code: _, from_name, from_peer_id } => {
+                egui::CentralPanel::default().frame(egui::Frame::none().fill(CLR_BG)).show(ctx, |ui| {
+                    self.draw_incoming(ui, ctx, from_peer_id, &from_name);
+                });
+                ctx.request_repaint_after(Duration::from_millis(50));
+                return;
+            }
+            CallState::InCall { peer_id, peer_name, call_id, started_at } => {
+                egui::CentralPanel::default().frame(egui::Frame::none().fill(CLR_BG)).show(ctx, |ui| {
+                    self.draw_in_call(ui, ctx, peer_id, &peer_name, started_at, call_id);
+                });
+                ctx.request_repaint_after(Duration::from_millis(50));
+                return;
+            }
+            CallState::None => {}
+        }
+
+        // Верхняя панель навигации (Чистая вкладка без костылей)
+        egui::TopBottomPanel::top("topbar")
+            .frame(egui::Frame::none().fill(CLR_SURFACE).inner_margin(egui::Margin::symmetric(12.0, 8.0)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    // Логотип + Имя
+                    draw_chebu_icon(ui, 26.0);
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Cheburgram").size(15.0).strong().color(CLR_ACCENT));
+
+                    ui.add_space(16.0);
+
+                    // Вкладки навигации
+                    let tab_btn = |ui: &mut egui::Ui, current: Tab, target: Tab, text: &str| -> bool {
+                        let is_sel = current == target;
+                        let bg = if is_sel { CLR_SURFACE2 } else { egui::Color32::TRANSPARENT };
+                        let fg = if is_sel { CLR_ACCENT } else { CLR_TEXT_DIM };
+                        ui.add(egui::Button::new(
+                            egui::RichText::new(text).size(13.0).color(fg).strong()
+                        ).fill(bg).rounding(egui::Rounding::same(6.0))).clicked()
+                    };
+
+                    if tab_btn(ui, self.active_tab, Tab::Contacts, "👥 Друзья") {
+                        self.active_tab = Tab::Contacts;
+                        self.request_friends_status();
+                    }
+                    if tab_btn(ui, self.active_tab, Tab::History, "📋 История") {
+                        self.active_tab = Tab::History;
+                    }
+                    if tab_btn(ui, self.active_tab, Tab::Settings, "⚙ Настройки") {
+                        self.active_tab = Tab::Settings;
+                    }
+                });
+            });
 
         // Нижняя строка статуса
-        if !self.status.is_empty() && screen != Screen::Login {
-            egui::TopBottomPanel::bottom("statusbar")
-                .frame(egui::Frame::none()
-                    .fill(CLR_SURFACE)
-                    .inner_margin(egui::Margin::symmetric(12.0, 4.0)))
-                .show(ctx, |ui| {
+        egui::TopBottomPanel::bottom("statusbar")
+            .frame(egui::Frame::none().fill(CLR_SURFACE).inner_margin(egui::Margin::symmetric(12.0, 4.0)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let dot_col = if self.is_connected { CLR_GREEN } else { CLR_RED };
+                    let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot_rect.center(), 4.0, dot_col);
                     ui.label(egui::RichText::new(&self.status).small().color(CLR_TEXT_DIM));
                 });
-        }
+            });
 
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(CLR_BG))
-            .show(ctx, |ui| {
-            match screen {
-                Screen::Login => self.draw_login(ui, ctx),
-                Screen::Contacts => self.draw_contacts(ui),
-                Screen::Calling { to_id, to_name } => self.draw_calling(ui, ctx, to_id, &to_name.clone()),
-                Screen::IncomingCall { from_id, from_name } => self.draw_incoming(ui, ctx, from_id, &from_name.clone()),
-                Screen::InCall { peer_id, peer_name, call_id, started_at } => {
-                    let pn = peer_name.clone();
-                    self.draw_in_call(ui, ctx, peer_id, &pn, started_at, call_id);
-                }
-                Screen::History => self.draw_history(ui),
-                Screen::Settings => self.draw_settings(ui),
+        // Центральная панель по выбранной вкладке
+        egui::CentralPanel::default().frame(egui::Frame::none().fill(CLR_BG)).show(ctx, |ui| {
+            match self.active_tab {
+                Tab::Contacts => self.draw_contacts(ui, ctx),
+                Tab::History => self.draw_history(ui),
+                Tab::Settings => self.draw_settings(ui),
             }
         });
 
@@ -846,16 +977,13 @@ impl App {
             ),
             |ui| {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(50.0);
-
-                    // Иконка Чебурашки
+                    ui.add_space(40.0);
                     draw_chebu_icon_large(ui, 72.0);
                     ui.add_space(12.0);
                     ui.label(egui::RichText::new("Cheburgram").size(26.0).strong().color(CLR_ACCENT));
                     ui.label(egui::RichText::new("Голосовой мессенджер").small().color(CLR_TEXT_DIM));
-                    ui.add_space(32.0);
+                    ui.add_space(28.0);
 
-                    // Карточка входа
                     egui::Frame::none()
                         .fill(CLR_SURFACE)
                         .rounding(egui::Rounding::same(12.0))
@@ -863,7 +991,6 @@ impl App {
                         .stroke(egui::Stroke::new(1.0, CLR_BORDER))
                         .show(ui, |ui| {
                             ui.set_width(280.0);
-
                             ui.label(egui::RichText::new("Ваше имя").color(CLR_TEXT_DIM).small());
                             ui.add_space(4.0);
                             let resp = ui.add(
@@ -905,26 +1032,98 @@ impl App {
         );
     }
 
-    fn draw_contacts(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(12.0);
+    fn draw_contacts(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.add_space(8.0);
 
-        if self.contacts.is_empty() {
+        // Карточка "Мой ID"
+        egui::Frame::none()
+            .fill(CLR_SURFACE)
+            .rounding(egui::Rounding::same(10.0))
+            .stroke(egui::Stroke::new(1.0, CLR_BORDER))
+            .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Мой ID:").color(CLR_TEXT_DIM));
+                    ui.label(
+                        egui::RichText::new(&self.cfg.user_code)
+                            .size(17.0)
+                            .strong()
+                            .color(CLR_ACCENT)
+                            .font(egui::FontId::monospace(17.0)),
+                    );
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let btn_text = if self.copied_code_banner { "Скопировано!" } else { "📋 Скопировать" };
+                        if ui.add(egui::Button::new(
+                            egui::RichText::new(btn_text).small().color(CLR_TEXT)
+                        ).fill(CLR_SURFACE2)).clicked() {
+                            ctx.output_mut(|o| o.copied_text = self.cfg.user_code.clone());
+                            self.copied_code_banner = true;
+                        }
+                    });
+                });
+            });
+
+        ui.add_space(8.0);
+
+        // Форма добавления друга по ID
+        egui::Frame::none()
+            .fill(CLR_SURFACE)
+            .rounding(egui::Rounding::same(10.0))
+            .stroke(egui::Stroke::new(1.0, CLR_BORDER))
+            .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("➕ Добавить по ID:").color(CLR_TEXT_DIM));
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.add_friend_input)
+                            .hint_text("6 цифр")
+                            .desired_width(90.0)
+                            .font(egui::FontId::monospace(14.0))
+                            .text_color(CLR_TEXT)
+                    );
+                    if resp.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        let code = self.add_friend_input.clone();
+                        self.add_friend_by_code(&code);
+                    }
+
+                    if ui.add(egui::Button::new(
+                        egui::RichText::new("Найти").strong().color(egui::Color32::WHITE)
+                    ).fill(CLR_ACCENT)).clicked() {
+                        let code = self.add_friend_input.clone();
+                        self.add_friend_by_code(&code);
+                    }
+                });
+            });
+
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new("Мои контакты").size(15.0).strong().color(CLR_TEXT));
+        ui.add_space(4.0);
+
+        if self.cfg.friends.is_empty() {
             ui.vertical_centered(|ui| {
-                ui.add_space(60.0);
-                ui.label(egui::RichText::new("Никого нет онлайн").size(17.0).color(CLR_TEXT_DIM));
-                ui.add_space(8.0);
-                ui.label(egui::RichText::new("Когда другие участники подключатся — они появятся здесь")
-                    .small().color(egui::Color32::from_rgb(60, 70, 80)));
+                ui.add_space(40.0);
+                ui.label(egui::RichText::new("Список контактов пуст").size(16.0).color(CLR_TEXT_DIM));
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Введите 6-значный ID друга выше, чтобы добавить его")
+                    .small().color(CLR_TEXT_DIM));
             });
             return;
         }
 
-        let contacts = self.contacts.clone();
-        let mut call_target: Option<(u32, String)> = None;
+        let friends = self.cfg.friends.clone();
+        let statuses = self.friend_statuses.clone();
+        let mut call_action: Option<(String, String)> = None;
+        let mut remove_action: Option<String> = None;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for c in &contacts {
-                let resp = egui::Frame::none()
+            for f in &friends {
+                let st = statuses.get(&f.user_code);
+                let is_online = st.map(|s| s.is_online).unwrap_or(false);
+
+                egui::Frame::none()
                     .fill(CLR_SURFACE)
                     .rounding(egui::Rounding::same(10.0))
                     .stroke(egui::Stroke::new(1.0, CLR_BORDER))
@@ -933,29 +1132,42 @@ impl App {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
                             // Аватар
-                            let col = name_color(&c.name);
-                            let (rect, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
-                            ui.painter().circle_filled(rect.center(), 22.0, col);
-                            let first = c.name.chars().next().unwrap_or('?').to_uppercase().next().unwrap_or('?');
+                            let col = name_color(&f.name);
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
+                            ui.painter().circle_filled(rect.center(), 20.0, col);
+                            let first = f.name.chars().next().unwrap_or('?').to_uppercase().next().unwrap_or('?');
                             ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
-                                first.to_string(), egui::FontId::proportional(22.0), egui::Color32::WHITE);
+                                first.to_string(), egui::FontId::proportional(20.0), egui::Color32::WHITE);
 
-                            ui.add_space(10.0);
+                            ui.add_space(8.0);
                             ui.vertical(|ui| {
-                                ui.label(egui::RichText::new(&c.name).size(15.0).strong().color(CLR_TEXT));
+                                ui.label(egui::RichText::new(&f.name).size(15.0).strong().color(CLR_TEXT));
                                 ui.horizontal(|ui| {
-                                    let dot_rect = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover()).0;
-                                    ui.painter().circle_filled(dot_rect.center(), 4.0, CLR_GREEN);
-                                    ui.label(egui::RichText::new("в сети").small().color(CLR_GREEN));
+                                    let dot_col = if is_online { CLR_GREEN } else { CLR_TEXT_DIM };
+                                    let (dot, _) = ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
+                                    ui.painter().circle_filled(dot.center(), 3.0, dot_col);
+                                    let txt = if is_online { "в сети" } else { "не в сети" };
+                                    ui.label(egui::RichText::new(format!("{} • ID {}", txt, f.user_code)).small().color(dot_col));
                                 });
                             });
 
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let call_btn = egui::Button::new(
-                                    egui::RichText::new("  Позвонить  ").strong().color(egui::Color32::WHITE)
-                                ).fill(CLR_GREEN).rounding(egui::Rounding::same(8.0));
-                                if ui.add(call_btn).clicked() {
-                                    call_target = Some((c.peer_id, c.name.clone()));
+                                // Удалить контакт
+                                if ui.add(egui::Button::new(
+                                    egui::RichText::new("🗑").small().color(CLR_TEXT_DIM)
+                                ).fill(egui::Color32::TRANSPARENT)).clicked() {
+                                    remove_action = Some(f.user_code.clone());
+                                }
+
+                                ui.add_space(4.0);
+
+                                // Позвонить
+                                let btn = egui::Button::new(
+                                    egui::RichText::new("Позвонить").strong().color(egui::Color32::WHITE)
+                                ).fill(if is_online { CLR_GREEN } else { CLR_SURFACE2 });
+
+                                if ui.add_enabled(is_online, btn).clicked() {
+                                    call_action = Some((f.user_code.clone(), f.name.clone()));
                                 }
                             });
                         });
@@ -964,16 +1176,22 @@ impl App {
             }
         });
 
-        if let Some((to_id, to_name)) = call_target {
-            self.call_user(to_id, to_name);
+        if let Some(code) = remove_action {
+            self.cfg.friends.retain(|f| f.user_code != code);
+            self.friend_statuses.remove(&code);
+            save_config(&self.cfg);
+            self.status = "Контакт удалён".into();
+        }
+
+        if let Some((code, name)) = call_action {
+            self.call_user(code, name);
         }
     }
 
-    fn draw_calling(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, to_id: u32, to_name: &str) {
+    fn draw_calling(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, to_name: &str) {
         ui.vertical_centered(|ui| {
             ui.add_space(60.0);
 
-            // Пульсирующий аватар
             let t = ctx.input(|i| i.time) as f32;
             let pulse = ((t * 2.5).sin() * 0.15 + 0.85) as f32;
             let col = name_color(to_name);
@@ -992,16 +1210,14 @@ impl App {
             ui.add_space(36.0);
 
             if ui.add(egui::Button::new(
-                egui::RichText::new("  Отмена  ").strong().color(egui::Color32::WHITE)
+                egui::RichText::new("Отмена").strong().color(egui::Color32::WHITE)
             ).fill(CLR_RED).min_size(egui::vec2(140.0, 42.0))).clicked() {
-                self.send_msg(ControlMessage::CallReject { to_id });
-                self.screen = Screen::Contacts;
-                self.status = "Отменено".into();
+                self.end_call();
             }
         });
     }
 
-    fn draw_incoming(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, from_id: u32, from_name: &str) {
+    fn draw_incoming(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, from_peer_id: u32, from_name: &str) {
         ui.vertical_centered(|ui| {
             ui.add_space(50.0);
 
@@ -1025,16 +1241,16 @@ impl App {
                 ui.add_space(30.0);
                 let fn_clone = from_name.to_string();
                 if ui.add(egui::Button::new(
-                    egui::RichText::new("  Принять  ").strong().color(egui::Color32::WHITE)
+                    egui::RichText::new("Принять").strong().color(egui::Color32::WHITE)
                 ).fill(CLR_GREEN).min_size(egui::vec2(120.0, 44.0))).clicked() {
-                    self.accept_call(from_id, fn_clone);
+                    self.accept_call(from_peer_id, fn_clone);
                 }
                 ui.add_space(16.0);
                 let fn2 = from_name.to_string();
                 if ui.add(egui::Button::new(
-                    egui::RichText::new("  Отклонить  ").strong().color(egui::Color32::WHITE)
+                    egui::RichText::new("Отклонить").strong().color(egui::Color32::WHITE)
                 ).fill(CLR_RED).min_size(egui::vec2(120.0, 44.0))).clicked() {
-                    self.reject_call(from_id, &fn2);
+                    self.reject_call(from_peer_id, &fn2);
                 }
             });
         });
@@ -1046,7 +1262,6 @@ impl App {
         ui.vertical_centered(|ui| {
             ui.add_space(16.0);
 
-            // Аватар собеседника
             let col = name_color(peer_name);
             let (rect, _) = ui.allocate_exact_size(egui::vec2(68.0, 68.0), egui::Sense::hover());
             ui.painter().circle_filled(rect.center(), 34.0, col);
@@ -1063,7 +1278,6 @@ impl App {
 
             ui.add_space(20.0);
 
-            // VU метр
             egui::Frame::none()
                 .fill(CLR_SURFACE)
                 .rounding(egui::Rounding::same(10.0))
@@ -1081,7 +1295,6 @@ impl App {
                     });
                     ui.add_space(4.0);
 
-                    // Ручной VU-бар через painter
                     let (vu_rect, _) = ui.allocate_exact_size(egui::vec2(272.0, 12.0), egui::Sense::hover());
                     ui.painter().rect_filled(vu_rect, egui::Rounding::same(6.0), CLR_SURFACE2);
                     let fill_w = (vu_rect.width() * val).max(0.0);
@@ -1100,7 +1313,6 @@ impl App {
 
             ui.add_space(16.0);
 
-            // Кнопки управления
             egui::Frame::none()
                 .fill(CLR_SURFACE)
                 .rounding(egui::Rounding::same(10.0))
@@ -1136,7 +1348,7 @@ impl App {
 
     fn draw_history(&self, ui: &mut egui::Ui) {
         ui.add_space(12.0);
-        ui.label(egui::RichText::new("История звонков").size(16.0).strong().color(CLR_TEXT));
+        ui.label(egui::RichText::new("История звонков").size(15.0).strong().color(CLR_TEXT));
         ui.add_space(8.0);
 
         if self.cfg.call_history.is_empty() {
@@ -1162,7 +1374,6 @@ impl App {
                                 CallDirection::Outgoing => ("Исходящий", CLR_BLUE),
                                 CallDirection::Missed   => ("Пропущен ", CLR_RED),
                             };
-                            // Цветная полоска слева
                             let (strip, _) = ui.allocate_exact_size(egui::vec2(3.0, 36.0), egui::Sense::hover());
                             ui.painter().rect_filled(strip, egui::Rounding::same(2.0), dir_col);
                             ui.add_space(8.0);
@@ -1185,7 +1396,7 @@ impl App {
 
     fn draw_settings(&mut self, ui: &mut egui::Ui) {
         ui.add_space(12.0);
-        ui.label(egui::RichText::new("Настройки").size(16.0).strong().color(CLR_TEXT));
+        ui.label(egui::RichText::new("Настройки").size(15.0).strong().color(CLR_TEXT));
         ui.add_space(10.0);
 
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1203,12 +1414,15 @@ impl App {
                         self.status = "Имя обновлено".into();
                     }
                 });
-                ui.add_space(4.0);
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("ID устройства:").color(CLR_TEXT_DIM).small());
-                    ui.label(egui::RichText::new(format!("{}...", &self.cfg.client_id[..8]))
-                        .small().color(egui::Color32::from_rgb(80, 90, 100))
-                        .font(egui::FontId::monospace(11.0)));
+                    ui.label(egui::RichText::new("Ваш ID:").color(CLR_TEXT_DIM));
+                    ui.label(
+                        egui::RichText::new(&self.cfg.user_code)
+                            .strong()
+                            .color(CLR_ACCENT)
+                            .font(egui::FontId::monospace(14.0)),
+                    );
                 });
             });
 
@@ -1224,6 +1438,7 @@ impl App {
                         egui::RichText::new("OK").color(egui::Color32::WHITE)
                     ).fill(CLR_SURFACE2)).clicked() {
                         save_config(&self.cfg);
+                        self.status = "Адрес сервера сохранён".into();
                     }
                 });
             });
@@ -1231,7 +1446,7 @@ impl App {
             ui.add_space(8.0);
 
             // Аудио
-            settings_section(ui, "Аудио", |ui| {
+            settings_section(ui, "Аудио устрйства", |ui| {
                 let prev_in = self.devs.sel_in;
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Микрофон:").color(CLR_TEXT_DIM));
@@ -1248,7 +1463,6 @@ impl App {
                     self.stop_mic_test();
                 }
 
-                // Кнопка теста микрофона
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     let test_col = if self.mic_test_active { CLR_RED } else { CLR_GREEN };
@@ -1260,7 +1474,6 @@ impl App {
                     }
                 });
 
-                // VU-бар теста
                 if self.mic_test_active {
                     ui.add_space(6.0);
                     let lvl = self.mic_test_level.load(Ordering::Relaxed);
@@ -1277,9 +1490,6 @@ impl App {
                         }
                         ui.label(egui::RichText::new(format!("{}%", lvl)).small().color(CLR_TEXT_DIM));
                     });
-                    if lvl == 0 {
-                        ui.label(egui::RichText::new("Говорите что-нибудь...").small().color(CLR_TEXT_DIM));
-                    }
                 }
 
                 ui.add_space(8.0);
@@ -1301,14 +1511,12 @@ impl App {
                     self.cfg.selected_input = self.devs.sel_in;
                     self.cfg.selected_output = self.devs.sel_out;
                     save_config(&self.cfg);
-                    self.status = "Аудио сохранено".into();
+                    self.status = "Настройки аудио сохранены".into();
                 }
             });
         });
     }
 }
-
-// ─── Вспомогательные UI функции ──────────────────────────────────────────────
 
 fn settings_section(ui: &mut egui::Ui, title: &str, content: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::none()
@@ -1319,59 +1527,13 @@ fn settings_section(ui: &mut egui::Ui, title: &str, content: impl FnOnce(&mut eg
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(egui::RichText::new(title).strong().color(CLR_TEXT));
-            ui.add_space(8.0);
+            ui.add_space(6.0);
             ui.separator();
-            ui.add_space(8.0);
+            ui.add_space(6.0);
             content(ui);
         });
 }
 
-fn icon_btn(ui: &mut egui::Ui, _tip: &str, active: bool, draw: impl FnOnce(&mut egui::Ui)) -> bool {
-    let col = if active { CLR_ACCENT_DIM } else { egui::Color32::TRANSPARENT };
-    ui.add(egui::Button::new("").fill(col).min_size(egui::vec2(28.0, 28.0))).clicked()
-        | {
-            let r = ui.cursor();
-            let sz = egui::vec2(16.0, 16.0);
-            let center = egui::pos2(r.min.x + 6.0, r.min.y - 22.0);
-            let (_rect, _resp) = ui.allocate_exact_size(egui::vec2(0.1, 0.1), egui::Sense::hover());
-            let _ = center;
-            let _ = sz;
-            draw(ui);
-            false
-        }
-}
-
-/// Нарисовать иконку шестерёнки (упрощённо)
-fn gear_icon(ui: &mut egui::Ui, size: f32, color: egui::Color32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
-    let p = ui.painter();
-    let c = rect.center();
-    let r = size * 0.35;
-    p.circle_stroke(c, r, egui::Stroke::new(2.0, color));
-    p.circle_filled(c, r * 0.4, color);
-    // Зубцы
-    for i in 0..6 {
-        let a = i as f32 * std::f32::consts::TAU / 6.0;
-        let (sa, ca2) = a.sin_cos();
-        let p1 = c + egui::vec2(ca2, sa) * r * 0.9;
-        let p2 = c + egui::vec2(ca2, sa) * (r * 0.9 + size * 0.12);
-        p.line_segment([p1, p2], egui::Stroke::new(2.5, color));
-    }
-}
-
-/// Нарисовать иконку часов (история)
-fn clock_icon(ui: &mut egui::Ui, size: f32, color: egui::Color32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
-    let p = ui.painter();
-    let c = rect.center();
-    let r = size * 0.45;
-    p.circle_stroke(c, r, egui::Stroke::new(1.5, color));
-    // Стрелки
-    p.line_segment([c, c + egui::vec2(0.0, -r * 0.6)], egui::Stroke::new(1.5, color));
-    p.line_segment([c, c + egui::vec2(r * 0.4, 0.0)], egui::Stroke::new(1.5, color));
-}
-
-/// Рисуем иконку Чебурашки (маленькая, для топбара)
 fn draw_chebu_icon(ui: &mut egui::Ui, size: f32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
     let p = ui.painter();
@@ -1380,22 +1542,16 @@ fn draw_chebu_icon(ui: &mut egui::Ui, size: f32) {
     let ear_r = size * 0.22;
     let brown = egui::Color32::from_rgb(166, 110, 71);
     let bg = egui::Color32::from_rgb(188, 230, 255);
-    // Фон кружок
     p.circle_filled(c, size * 0.5, bg);
-    // Уши
     p.circle_filled(c + egui::vec2(-r * 0.9, -r * 0.1), ear_r, brown);
     p.circle_filled(c + egui::vec2(r * 0.9, -r * 0.1), ear_r, brown);
-    // Голова
     p.circle_filled(c + egui::vec2(0.0, r * 0.05), r, brown);
-    // Мордочка
     let face = egui::Color32::from_rgb(245, 214, 184);
     p.circle_filled(c + egui::vec2(0.0, r * 0.15), r * 0.75, face);
-    // Глаза
     p.circle_filled(c + egui::vec2(-r * 0.3, -r * 0.1), r * 0.18, egui::Color32::from_rgb(40, 20, 10));
     p.circle_filled(c + egui::vec2(r * 0.3, -r * 0.1), r * 0.18, egui::Color32::from_rgb(40, 20, 10));
 }
 
-/// Большая иконка для логина
 fn draw_chebu_icon_large(ui: &mut egui::Ui, size: f32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
     let p = ui.painter();
@@ -1405,21 +1561,17 @@ fn draw_chebu_icon_large(ui: &mut egui::Ui, size: f32) {
     let brown = egui::Color32::from_rgb(166, 110, 71);
     let lt_brown = egui::Color32::from_rgb(190, 133, 92);
     let bg_col = egui::Color32::from_rgb(140, 195, 230);
-    // Фон круг
     p.circle_filled(c, size * 0.5, bg_col);
-    // Уши большие
     p.circle_filled(c + egui::vec2(-r, -r * 0.05), ear_r, brown);
     p.circle_filled(c + egui::vec2(r, -r * 0.05), ear_r, brown);
     p.circle_filled(c + egui::vec2(-r, -r * 0.05), ear_r * 0.75, lt_brown);
     p.circle_filled(c + egui::vec2(r, -r * 0.05), ear_r * 0.75, lt_brown);
-    // Звуковые волны в ушах (дуги через сегменты)
     for i in 1..=2u8 {
         let rr = ear_r * (0.4 + i as f32 * 0.25);
         let stroke = egui::Stroke::new(2.0, egui::Color32::WHITE);
         let lc = c + egui::vec2(-r, -r * 0.05);
         let rc_pos = c + egui::vec2(r, -r * 0.05);
         let segments = 10;
-        // Левое ухо: дуга от -0.8 до 0.8 рад
         for s in 0..segments {
             let a1 = -0.8 + (s as f32 / segments as f32) * 1.6;
             let a2 = -0.8 + ((s + 1) as f32 / segments as f32) * 1.6;
@@ -1427,7 +1579,6 @@ fn draw_chebu_icon_large(ui: &mut egui::Ui, size: f32) {
             let p2 = lc + egui::vec2(a2.cos() * rr, a2.sin() * rr);
             p.line_segment([p1, p2], stroke);
         }
-        // Правое ухо: дуга от PI-0.8 до PI+0.8 рад
         let a_base = std::f32::consts::PI;
         for s in 0..segments {
             let a1 = a_base - 0.8 + (s as f32 / segments as f32) * 1.6;
@@ -1437,19 +1588,15 @@ fn draw_chebu_icon_large(ui: &mut egui::Ui, size: f32) {
             p.line_segment([p1, p2], stroke);
         }
     }
-    // Голова
     p.circle_filled(c + egui::vec2(0.0, r * 0.1), r, brown);
-    // Мордочка
     let face = egui::Color32::from_rgb(245, 214, 184);
     p.circle_filled(c + egui::vec2(0.0, r * 0.2), r * 0.72, face);
-    // Глаза
     let eye_l = c + egui::vec2(-r * 0.28, r * 0.0);
     let eye_r = c + egui::vec2(r * 0.28, r * 0.0);
     p.circle_filled(eye_l, r * 0.17, egui::Color32::from_rgb(40, 20, 10));
     p.circle_filled(eye_r, r * 0.17, egui::Color32::from_rgb(40, 20, 10));
     p.circle_filled(eye_l + egui::vec2(r * 0.05, -r * 0.04), r * 0.07, egui::Color32::WHITE);
     p.circle_filled(eye_r + egui::vec2(r * 0.05, -r * 0.04), r * 0.07, egui::Color32::WHITE);
-    // Нос
     p.circle_filled(c + egui::vec2(0.0, r * 0.25), r * 0.1, egui::Color32::from_rgb(40, 20, 10));
 }
 
@@ -1470,8 +1617,6 @@ fn name_color(name: &str) -> egui::Color32 {
     };
     egui::Color32::from_rgb(((r+m)*255.0) as u8, ((g+m)*255.0) as u8, ((b+m)*255.0) as u8)
 }
-
-// ─── Шрифты и запуск ─────────────────────────────────────────────────────────
 
 fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
@@ -1525,14 +1670,13 @@ fn make_app_icon() -> egui::IconData {
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    info!("Cheburgram v2 запуск...");
+    info!("Cheburgram v2.2 запуск...");
 
-    // Автозагрузка при старте
     setup_autostart();
 
     let icon = make_app_icon();
     let vp = egui::ViewportBuilder::default()
-        .with_inner_size([420.0, 580.0])
+        .with_inner_size([430.0, 600.0])
         .with_min_inner_size([380.0, 500.0])
         .with_title("Cheburgram")
         .with_resizable(true)

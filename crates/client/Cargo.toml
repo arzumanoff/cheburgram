@@ -19,6 +19,8 @@ uuid.workspace = true
 chrono.workspace = true
 tray-icon.workspace = true
 winreg.workspace = true
+rand.workspace = true
+
 
 [build-dependencies]
 winres = "0.1"
