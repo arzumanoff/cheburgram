@@ -176,6 +176,16 @@ async fn handle_client(stream: TcpStream, state: SharedState) -> Result<()> {
                 let mut st = state.lock().await;
                 let room_code = room_code.trim().to_uppercase();
 
+                if !st.rooms.contains_key(&room_code) {
+                    let _ = tx.send(ControlMessage::Error {
+                        message: "Комната с таким кодом не найдена".to_string(),
+                    });
+                    continue;
+                }
+
+                let peer_id = st.next_peer_id;
+                st.next_peer_id += 1;
+
                 if let Some(room) = st.rooms.get_mut(&room_code) {
                     if room.participants.len() >= 2 {
                         let _ = tx.send(ControlMessage::Error {
@@ -183,9 +193,6 @@ async fn handle_client(stream: TcpStream, state: SharedState) -> Result<()> {
                         });
                         continue;
                     }
-
-                    let peer_id = st.next_peer_id;
-                    st.next_peer_id += 1;
 
                     info!("Участник {} подключился к комнате {}", peer_id, room_code);
 
@@ -219,10 +226,6 @@ async fn handle_client(stream: TcpStream, state: SharedState) -> Result<()> {
                             }
                         }
                     }
-                } else {
-                    let _ = tx.send(ControlMessage::Error {
-                        message: "Комната с таким кодом не найдена".to_string(),
-                    });
                 }
             }
             ControlMessage::Ping => {
