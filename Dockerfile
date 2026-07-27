@@ -1,13 +1,16 @@
-# Multi-stage Dockerfile for Cheburgram Server
+# Multi-stage Dockerfile for Cheburgram Server (Lightweight)
 FROM rust:alpine as builder
 
 RUN apk add --no-cache musl-dev
 
 WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
-COPY crates ./crates
+COPY crates/protocol ./crates/protocol
+COPY crates/server ./crates/server
 
-# Собираем только серверный бинарник cheburgram-server
+# Генерируем минимальный Cargo.toml исключительно для сервера (без GUI и клиента)
+RUN printf '[workspace]\nresolver = "2"\nmembers = [\n  "crates/protocol",\n  "crates/server"\n]\n' > Cargo.toml
+
+# Собираем исключительно серверные зависимости (tokio, serde, rand, tracing)
 RUN cargo build --release --package cheburgram-server
 
 FROM alpine:latest
