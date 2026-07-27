@@ -1,5 +1,5 @@
 # Multi-stage Dockerfile for Cheburgram Server
-FROM rust:1.78-alpine as builder
+FROM rust:alpine as builder
 
 RUN apk add --no-cache musl-dev
 
