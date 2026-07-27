@@ -324,6 +324,19 @@ impl CheburgramApp {
 
         self.udp_socket = Some(udp_socket.clone());
 
+        // Сразу отправляем регистрационный пакет, чтобы сервер узнал наш UDP-адрес
+        // и мог пересылать нам голос от собеседника
+        let reg_packet = AudioPacket::new(
+            room_code.clone(),
+            peer_id,
+            0,
+            0,
+            vec![], // пустой payload — только регистрация
+        );
+        if let Ok(bytes) = reg_packet.to_bytes() {
+            let _ = udp_socket.send_to(&bytes, target_udp_addr);
+        }
+
         let stop_signal = self.stop_signal.clone();
         let mic_level = self.mic_level.clone();
         let packets_sent = self.packets_sent.clone();
@@ -331,9 +344,23 @@ impl CheburgramApp {
         let input_dev_name = self.devices.input_devices.get(self.devices.selected_input).cloned().unwrap_or_default();
         let output_dev_name = self.devices.output_devices.get(self.devices.selected_output).cloned().unwrap_or_default();
 
-        // 1. Захват микрофона
+        // 1. Захват микрофона (с периодическими пингами для поддержания UDP регистрации)
         let socket_send = udp_socket.clone();
-        let room_code_send = room_code;
+        let room_code_send = room_code.clone();
+        let reg_socket = udp_socket.clone();
+        let reg_room = room_code.clone();
+        let reg_peer = peer_id;
+        let reg_stop = self.stop_signal.clone();
+        thread::spawn(move || {
+            // Периодически шлём пустые пакеты-пинги чтобы NAT не закрыл дыру
+            while !reg_stop.load(Ordering::Relaxed) {
+                let ping = AudioPacket::new(reg_room.clone(), reg_peer, 0, 0, vec![]);
+                if let Ok(bytes) = ping.to_bytes() {
+                    let _ = reg_socket.send_to(&bytes, target_udp_addr);
+                }
+                thread::sleep(Duration::from_secs(2));
+            }
+        });
         thread::spawn(move || {
             if let Err(e) = run_audio_input_loop(
                 input_dev_name,

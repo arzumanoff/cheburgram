@@ -77,6 +77,11 @@ async fn main() -> Result<()> {
                                 p.udp_addr = Some(src_addr);
                             }
 
+                            // Пустые пакеты — только регистрация UDP адреса, не пересылаем
+                            if packet.payload.is_empty() {
+                                continue;
+                            }
+
                             // Пересылаем пакет ВСЕМ ДРУГИМ участникам комнаты
                             for (&peer_id, participant) in &room.participants {
                                 if peer_id != packet.header.sender_id {
