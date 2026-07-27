@@ -1065,17 +1065,18 @@ fn draw_history(app: &mut App, ui: &mut egui::Ui) {
                             ui.label(egui::RichText::new(&r.peer_name).strong().color(CLR_TEXT));
                             ui.horizontal(|ui| {
                                 ui.label(egui::RichText::new(dir_txt).small().color(dir_col));
-                                let dur = if r.duration_secs > 0 {
-                                    format!(" • {:02}:{:02}", r.duration_secs / 60, r.duration_secs % 60)
-                                } else {
-                                    String::new()
-                                };
                                 let ts = r.timestamp.get(..16).unwrap_or(&r.timestamp).replace('T', " ");
-                                ui.label(
-                                    egui::RichText::new(format!("{} • {}", dur.trim_start_matches(" • "), ts))
-                                        .small()
-                                        .color(CLR_TEXT_DIM),
-                                );
+                                let sub = if r.duration_secs > 0 {
+                                    format!(
+                                        "{:02}:{:02} • {}",
+                                        r.duration_secs / 60,
+                                        r.duration_secs % 60,
+                                        ts
+                                    )
+                                } else {
+                                    ts
+                                };
+                                ui.label(egui::RichText::new(sub).small().color(CLR_TEXT_DIM));
                             });
                         });
 
