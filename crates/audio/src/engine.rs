@@ -28,11 +28,15 @@ use crate::{FRAME_SIZE, MAX_OPUS_BYTES, OPUS_BITRATE, SAMPLE_RATE};
 
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
 const POP_INTERVAL: Duration = Duration::from_millis(20);
+/// Стартовая подушка кольца воспроизведения (тишина), мс
+const RING_PREROLL_MS: usize = 60;
 
 #[derive(Clone)]
 pub struct AudioStats {
     pub pkts_sent: Arc<AtomicU64>,
     pub pkts_recv: Arc<AtomicU64>,
+    /// Сколько раз кольцо воспроизведения оказалось пустым (диагностика «скрипов»)
+    pub underruns: Arc<AtomicU64>,
 }
 
 pub struct CallAudioConfig {
@@ -77,6 +81,7 @@ pub fn start_call_audio(cfg: CallAudioConfig) -> AudioHandle {
         stats: AudioStats {
             pkts_sent: Arc::new(AtomicU64::new(0)),
             pkts_recv: Arc::new(AtomicU64::new(0)),
+            underruns: Arc::new(AtomicU64::new(0)),
         },
         error: Arc::new(Mutex::new(None)),
         threads: Vec::new(),
@@ -128,11 +133,12 @@ pub fn start_call_audio(cfg: CallAudioConfig) -> AudioHandle {
         let out_muted = handle.output_muted.clone();
         let volume = handle.peer_volume.clone();
         let pkts_recv = handle.stats.pkts_recv.clone();
+        let underruns = handle.stats.underruns.clone();
         let err_out = handle.error.clone();
         let dev_name = cfg.output_device.clone();
         handle.threads.push(thread::spawn(move || {
             if let Err(e) =
-                run_playback(dev_name, sock, call_id, stop, out_muted, volume, pkts_recv)
+                run_playback(dev_name, sock, call_id, stop, out_muted, volume, pkts_recv, underruns)
             {
                 error!("Воспроизведение остановлено: {:?}", e);
                 set_err(&err_out, format!("Динамики: {}", e));
@@ -154,7 +160,7 @@ fn make_encoder() -> Result<Encoder> {
     let mut enc = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip)?;
     enc.set_bitrate(Bitrate::BitsPerSecond(OPUS_BITRATE))?;
     enc.enable_inband_fec()?;
-    enc.set_packet_loss_perc(15)?;
+    enc.set_packet_loss_perc(20)?;
     Ok(enc)
 }
 
@@ -307,6 +313,7 @@ fn run_playback(
     out_muted: Arc<AtomicBool>,
     volume: Arc<AtomicU32>,
     pkts_recv: Arc<AtomicU64>,
+    underruns: Arc<AtomicU64>,
 ) -> Result<()> {
     let device = devices::open_output(dev_name.as_deref())
         .ok_or_else(|| anyhow::anyhow!("нет доступного устройства вывода"))?;
@@ -324,65 +331,100 @@ fn run_playback(
     let err_fn = |e: cpal::StreamError| error!("cpal playback: {}", e);
 
     // Колбэк вывода: вытаскивает сэмплы микса, дублирует на все каналы,
-    // применяет громкость и мьют в реальном времени
+    // применяет громкость и мьют в реальном времени. Пустое кольцо → тишина
+    // и инкремент счётчика пропусков (диагностика в UI).
+    macro_rules! pop_sample {
+        ($cons:expr, $und:expr, $muted:expr, $vol:expr) => {
+            if $muted {
+                0.0
+            } else {
+                match $cons.pop() {
+                    Some(v) => v * $vol,
+                    None => {
+                        $und.fetch_add(1, Ordering::Relaxed);
+                        0.0
+                    }
+                }
+            }
+        };
+    }
+
     let stream = match fmt {
-        cpal::SampleFormat::F32 => device.build_output_stream(
-            &config,
-            move |d: &mut [f32], _| {
-                let vol = f32::from_bits(volume.load(Ordering::Relaxed));
-                let muted = out_muted.load(Ordering::Relaxed);
-                for frame in d.chunks_mut(out_channels) {
-                    let s = if muted { 0.0 } else { cons.pop().unwrap_or(0.0) * vol };
-                    for ch in frame.iter_mut() {
-                        *ch = s;
+        cpal::SampleFormat::F32 => {
+            let und = underruns.clone();
+            device.build_output_stream(
+                &config,
+                move |d: &mut [f32], _| {
+                    let vol = f32::from_bits(volume.load(Ordering::Relaxed));
+                    let muted = out_muted.load(Ordering::Relaxed);
+                    for frame in d.chunks_mut(out_channels) {
+                        let s = pop_sample!(cons, und, muted, vol);
+                        for ch in frame.iter_mut() {
+                            *ch = s;
+                        }
                     }
-                }
-            },
-            err_fn,
-            None,
-        )?,
-        cpal::SampleFormat::I16 => device.build_output_stream(
-            &config,
-            move |d: &mut [i16], _| {
-                let vol = f32::from_bits(volume.load(Ordering::Relaxed));
-                let muted = out_muted.load(Ordering::Relaxed);
-                for frame in d.chunks_mut(out_channels) {
-                    let s = if muted { 0.0 } else { cons.pop().unwrap_or(0.0) * vol };
-                    let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-                    for ch in frame.iter_mut() {
-                        *ch = v;
+                },
+                err_fn,
+                None,
+            )?
+        }
+        cpal::SampleFormat::I16 => {
+            let und = underruns.clone();
+            device.build_output_stream(
+                &config,
+                move |d: &mut [i16], _| {
+                    let vol = f32::from_bits(volume.load(Ordering::Relaxed));
+                    let muted = out_muted.load(Ordering::Relaxed);
+                    for frame in d.chunks_mut(out_channels) {
+                        let s = pop_sample!(cons, und, muted, vol);
+                        let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+                        for ch in frame.iter_mut() {
+                            *ch = v;
+                        }
                     }
-                }
-            },
-            err_fn,
-            None,
-        )?,
-        cpal::SampleFormat::U16 => device.build_output_stream(
-            &config,
-            move |d: &mut [u16], _| {
-                let vol = f32::from_bits(volume.load(Ordering::Relaxed));
-                let muted = out_muted.load(Ordering::Relaxed);
-                for frame in d.chunks_mut(out_channels) {
-                    let s = if muted { 0.0 } else { cons.pop().unwrap_or(0.0) * vol };
-                    let v = ((s.clamp(-1.0, 1.0) * 32767.0) + 32768.0) as u16;
-                    for ch in frame.iter_mut() {
-                        *ch = v;
+                },
+                err_fn,
+                None,
+            )?
+        }
+        cpal::SampleFormat::U16 => {
+            let und = underruns.clone();
+            device.build_output_stream(
+                &config,
+                move |d: &mut [u16], _| {
+                    let vol = f32::from_bits(volume.load(Ordering::Relaxed));
+                    let muted = out_muted.load(Ordering::Relaxed);
+                    for frame in d.chunks_mut(out_channels) {
+                        let s = pop_sample!(cons, und, muted, vol);
+                        let v = ((s.clamp(-1.0, 1.0) * 32767.0) + 32768.0) as u16;
+                        for ch in frame.iter_mut() {
+                            *ch = v;
+                        }
                     }
-                }
-            },
-            err_fn,
-            None,
-        )?,
+                },
+                err_fn,
+                None,
+            )?
+        }
         other => anyhow::bail!("формат вывода {:?} не поддерживается", other),
     };
     stream.play()?;
 
-    sock.set_read_timeout(Some(Duration::from_millis(5)))?;
+    sock.set_read_timeout(Some(Duration::from_millis(3)))?;
+
+    // Стартовая подушка: пока джиттер-буфер набирает глубину, кольцо не пустое
+    for _ in 0..(out_rate as usize / 1000 * RING_PREROLL_MS) {
+        let _ = prod.push(0.0);
+    }
 
     let mut peers: HashMap<u32, PeerState> = HashMap::new();
     let mut conv_out = RateConverter::new(SAMPLE_RATE, out_rate);
     let mut sbuf = vec![0u8; 65535];
-    let mut last_pop = Instant::now();
+
+    // Монотонный планировщик: фрейм ровно каждые 20 мс по нарастающему дедлайну.
+    // (В v3.0 тик считался «elapsed >= 20 мс → сброс в now»: реальный период
+    // выходил 22–25 мс, кольцо хронически опустошалось — те самые скрипы.)
+    let mut next_pop = Instant::now() + POP_INTERVAL;
 
     while !stop.load(Ordering::Relaxed) {
         // приём пакетов
@@ -410,8 +452,14 @@ fn run_playback(
         }
 
         // каждые 20 мс — вытащить по фрейму на собеседника, декодировать и смикшировать
-        if last_pop.elapsed() >= POP_INTERVAL {
-            last_pop = Instant::now();
+        let now = Instant::now();
+        if now >= next_pop {
+            // сильно отстали (засыпание ПК и т.п.) — не догоняем, а сбрасываем дедлайн
+            if now.duration_since(next_pop) > POP_INTERVAL * 4 {
+                next_pop = now;
+            }
+            next_pop += POP_INTERVAL;
+
             let mut mix = vec![0.0f32; FRAME_SIZE];
             let mut active = false;
             for peer in peers.values_mut() {
