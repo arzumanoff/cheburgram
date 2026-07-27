@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, Result};
 use cheburgram_protocol::{
-    AudioPacket, CallDirection, CallRecord, ControlMessage, FriendStatus,
+    AudioPacket, CallDirection, CallRecord, ControlMessage, FriendRequestInfo, FriendStatus,
 };
 use chrono::Utc;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -64,9 +64,13 @@ struct AppConfig {
     server_address: String,
     selected_input: usize,
     selected_output: usize,
+    #[serde(default = "default_zoom")]
+    zoom_factor: f32,
     friends: Vec<SavedFriend>,
     call_history: Vec<CallRecord>,
 }
+
+fn default_zoom() -> f32 { 1.0 }
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -80,6 +84,7 @@ impl Default for AppConfig {
             server_address: DEFAULT_SERVER.to_string(),
             selected_input: 0,
             selected_output: 0,
+            zoom_factor: 1.0,
             friends: Vec::new(),
             call_history: Vec::new(),
         }
@@ -171,6 +176,7 @@ struct App {
 
     // Онлайн статус сохранённых друзей (user_code -> FriendStatus)
     friend_statuses: std::collections::HashMap<String, FriendStatus>,
+    pending_friend_requests: Vec<FriendRequestInfo>,
     my_peer_id: Option<u32>,
 
     event_rx: Option<Receiver<ControlMessage>>,
@@ -218,6 +224,7 @@ impl Default for App {
             add_friend_input: String::new(),
             copied_code_banner: false,
             friend_statuses: std::collections::HashMap::new(),
+            pending_friend_requests: Vec::new(),
             my_peer_id: None,
             event_rx: None,
             stop: Arc::new(AtomicBool::new(false)),
@@ -329,23 +336,33 @@ impl App {
         }
     }
 
-    fn add_friend_by_code(&mut self, code: &str) {
+    fn send_friend_request(&mut self, code: &str) {
         let clean = code.trim().to_string();
         if clean.len() != 6 || !clean.chars().all(|c| c.is_ascii_digit()) {
             self.status = "ID должен состоять из 6 цифр".into();
             return;
         }
         if clean == self.cfg.user_code {
-            self.status = "Нельзя добавить свой собственный ID".into();
+            self.status = "Нельзя отправить запрос самому себе".into();
             return;
         }
         if self.cfg.friends.iter().any(|f| f.user_code == clean) {
-            self.status = "Этот контакт уже у вас в друзьях".into();
+            self.status = "Этот пользователь уже у вас в друзьях".into();
             return;
         }
 
-        self.status = format!("Поиск ID {}...", clean);
-        self.send_msg(ControlMessage::LookupUser { user_code: clean });
+        self.status = format!("Отправка запроса в друзья ID {}...", clean);
+        self.send_msg(ControlMessage::SendFriendRequest { target_code: clean });
+    }
+
+    fn accept_friend_request(&mut self, from_code: String) {
+        self.send_msg(ControlMessage::AcceptFriendRequest { from_code: from_code.clone() });
+        self.pending_friend_requests.retain(|r| r.from_code != from_code);
+    }
+
+    fn reject_friend_request(&mut self, from_code: String) {
+        self.send_msg(ControlMessage::RejectFriendRequest { from_code: from_code.clone() });
+        self.pending_friend_requests.retain(|r| r.from_code != from_code);
     }
 
     fn call_user(&mut self, target_code: String, target_name: String) {
@@ -423,7 +440,7 @@ impl App {
 
         let my_id = self.my_peer_id.unwrap_or(0);
 
-        // UDP keepalive
+        // 1. UDP keepalive / регистрация (гарантирует регистрацию UDP адреса на сервере)
         {
             let s = sock.clone();
             let st = self.stop.clone();
@@ -436,7 +453,7 @@ impl App {
             });
         }
 
-        // Микрофон
+        // 2. Захват микрофона (даже если у компьютера НЕТ микрофона — не ломает воспроизведение!)
         let in_dev = self.devs.inputs.get(self.devs.sel_in).cloned().unwrap_or_default();
         {
             let s = sock.clone();
@@ -446,12 +463,12 @@ impl App {
             let m = self.mic_muted;
             thread::spawn(move || {
                 if let Err(e) = audio_in(in_dev, s, target, call_id, my_id, st, lv, sn, m) {
-                    error!("Микрофон: {:?}", e);
+                    error!("Микрофон недоступен: {:?}", e);
                 }
             });
         }
 
-        // Вывод
+        // 3. Воспроизведение звука на динамиках
         let out_dev = self.devs.outputs.get(self.devs.sel_out).cloned().unwrap_or_default();
         {
             let s = sock.clone();
@@ -460,7 +477,7 @@ impl App {
             let ca = self.call_id_a.clone();
             thread::spawn(move || {
                 if let Err(e) = audio_out(out_dev, s, st, rc, ca) {
-                    error!("Вывод: {:?}", e);
+                    error!("Вывод звука: {:?}", e);
                 }
             });
         }
@@ -538,24 +555,22 @@ impl App {
                     self.status = format!("В сети как {} (ID: {})", self.cfg.display_name, user_code);
                     self.request_friends_status();
                 }
-                ControlMessage::UserLookupResult { found, user_code, name, is_online, peer_id } => {
-                    if found {
-                        let friend = SavedFriend { user_code: user_code.clone(), name: name.clone() };
-                        if !self.cfg.friends.contains(&friend) {
-                            self.cfg.friends.push(friend);
-                            save_config(&self.cfg);
-                        }
-                        self.friend_statuses.insert(user_code.clone(), FriendStatus {
-                            user_code: user_code.clone(),
-                            name,
-                            is_online,
-                            peer_id,
-                        });
-                        self.add_friend_input.clear();
-                        self.status = format!("Контакт ID {} добавлен!", user_code);
-                    } else {
-                        self.status = format!("Пользователь с ID {} не найден", user_code);
+                ControlMessage::IncomingFriendRequest { from_code, from_name } => {
+                    if !self.pending_friend_requests.iter().any(|r| r.from_code == from_code) {
+                        self.pending_friend_requests.push(FriendRequestInfo { from_code, from_name });
                     }
+                }
+                ControlMessage::PendingFriendRequests { requests } => {
+                    self.pending_friend_requests = requests;
+                }
+                ControlMessage::FriendRequestAccepted { user_code, name } => {
+                    let friend = SavedFriend { user_code: user_code.clone(), name: name.clone() };
+                    if !self.cfg.friends.contains(&friend) {
+                        self.cfg.friends.push(friend);
+                        save_config(&self.cfg);
+                    }
+                    self.status = format!("{} добавил(а) вас в друзья!", name);
+                    self.request_friends_status();
                 }
                 ControlMessage::FriendsStatus { friends } => {
                     for f in friends {
@@ -577,8 +592,8 @@ impl App {
                         from_peer_id,
                     };
                 }
-                ControlMessage::CallAccepted { peer_id, peer_name } => {
-                    let call_id = time_micros();
+                ControlMessage::CallAccepted { peer_id, peer_name, call_id } => {
+                    // Используем ЕДИНЫЙ call_id от сервера!
                     self.start_audio(peer_id, 7879, call_id);
                     let started = self.call_start.unwrap_or_else(Instant::now);
                     self.call_state = CallState::InCall {
@@ -616,7 +631,7 @@ impl App {
                     self.status = format!("{} завершил(а) звонок", peer_name);
                 }
                 ControlMessage::Error { message } => {
-                    self.status = format!("⚠ {}", message);
+                    self.status = format!("ℹ {}", message);
                     if matches!(self.call_state, CallState::Calling { .. }) {
                         self.call_state = CallState::None;
                     }
@@ -625,11 +640,6 @@ impl App {
             }
         }
     }
-}
-
-fn time_micros() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_micros() as u64
 }
 
 fn normalize(s: &str) -> String {
@@ -694,12 +704,40 @@ fn audio_in(dev: String, sock: Arc<StdUdpSocket>, target: SocketAddr,
 {
     let host = cpal::default_host();
     let device = if !dev.is_empty() && dev != "По умолчанию" {
-        host.input_devices()?.find(|d| d.name().ok().as_deref() == Some(&dev))
-            .ok_or_else(|| anyhow!("Микрофон не найден"))?
+        let dev_name = dev.clone();
+        host.input_devices().ok()
+            .and_then(|mut d| d.find(|d_item| d_item.name().ok().as_deref() == Some(&dev_name)))
+            .or_else(|| host.default_input_device())
     } else {
-        host.default_input_device().ok_or_else(|| anyhow!("Нет микрофона"))?
+        host.default_input_device()
     };
-    let dc = device.default_input_config()?;
+
+    let device = match device {
+        Some(d) => d,
+        None => {
+            // Если нет микрофона — всё равно шлём регистрационные пакеты чтобы динамики работали!
+            while !stop.load(Ordering::Relaxed) {
+                let p = AudioPacket::new(call_id, my_id, 0, vec![]);
+                if let Ok(b) = p.to_bytes() { let _ = sock.send_to(&b, target); }
+                thread::sleep(Duration::from_secs(2));
+            }
+            return Ok(());
+        }
+    };
+
+    let dc = match device.default_input_config() {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Ошибка конфига микрофона: {:?}", e);
+            while !stop.load(Ordering::Relaxed) {
+                let p = AudioPacket::new(call_id, my_id, 0, vec![]);
+                if let Ok(b) = p.to_bytes() { let _ = sock.send_to(&b, target); }
+                thread::sleep(Duration::from_secs(2));
+            }
+            return Ok(());
+        }
+    };
+
     let fmt = dc.sample_format();
     let config: cpal::StreamConfig = dc.into();
     let ch = config.channels as usize;
@@ -707,19 +745,34 @@ fn audio_in(dev: String, sock: Arc<StdUdpSocket>, target: SocketAddr,
     let buf = Arc::new(Mutex::new(Vec::<f32>::with_capacity(FRAME_SIZE * 4)));
     let bc = buf.clone();
     let ef = |e: cpal::StreamError| error!("cpal in: {}", e);
+
     let stream = match fmt {
         cpal::SampleFormat::F32 => device.build_input_stream(&config, move |d: &[f32], _: &_| {
             let mut b = bc.lock().unwrap();
             if ch == 1 { b.extend_from_slice(d); }
             else { for c in d.chunks(ch) { b.push(c.iter().sum::<f32>() / ch as f32); } }
-        }, ef, None)?,
+        }, ef, None),
         cpal::SampleFormat::I16 => device.build_input_stream(&config, move |d: &[i16], _: &_| {
             let mut b = bc.lock().unwrap();
             if ch == 1 { b.extend(d.iter().map(|&s| s as f32 / 32768.0)); }
             else { for c in d.chunks(ch) { b.push(c.iter().map(|&s| s as f32 / 32768.0).sum::<f32>() / ch as f32); } }
-        }, ef, None)?,
+        }, ef, None),
         _ => return Err(anyhow!("Формат не поддерживается")),
     };
+
+    let stream = match stream {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Не удалось запустить микрофонный поток: {:?}", e);
+            while !stop.load(Ordering::Relaxed) {
+                let p = AudioPacket::new(call_id, my_id, 0, vec![]);
+                if let Ok(b) = p.to_bytes() { let _ = sock.send_to(&b, target); }
+                thread::sleep(Duration::from_secs(2));
+            }
+            return Ok(());
+        }
+    };
+
     stream.play()?;
     let mut seq = 1u64;
     let mut obuf = vec![0u8; 4000];
@@ -782,13 +835,11 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
 
-        // ── Перехват закрытия окна ─────────────────────────────────────────
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.show_close_dialog = true;
         }
 
-        // ── Диалог закрытия ────────────────────────────────────────────────
         if self.show_close_dialog {
             egui::Window::new("Закрыть Cheburgram?")
                 .collapsible(false)
@@ -830,23 +881,10 @@ impl eframe::App for App {
                 });
         }
 
-        // ── Трей события ──────────────────────────────────────────────────
-        if let Ok(_ev) = TrayIconEvent::receiver().try_recv() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        }
-        if let Ok(ev) = MenuEvent::receiver().try_recv() {
-            let is_open = self.tray_open_id.as_ref().map(|id| *id == ev.id).unwrap_or(false);
-            let is_quit = self.tray_quit_id.as_ref().map(|id| *id == ev.id).unwrap_or(false);
-            if is_open {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            } else if is_quit {
-                std::process::exit(0);
-            }
-        }
+        // Динамическое масштабирование интерфейса
+        let zoom = if self.cfg.zoom_factor < 0.5 { 1.0 } else { self.cfg.zoom_factor };
+        ctx.set_pixels_per_point(zoom);
 
-        // Глобальная тема
         let mut vis = egui::Visuals::dark();
         vis.panel_fill = CLR_BG;
         vis.window_fill = CLR_SURFACE;
@@ -865,7 +903,6 @@ impl eframe::App for App {
         style.spacing.button_padding = egui::vec2(10.0, 6.0);
         ctx.set_style(style);
 
-        // Если не авторизован (имя пустое) — экран входа
         if !self.is_connected && self.cfg.display_name.is_empty() {
             egui::CentralPanel::default().frame(egui::Frame::none().fill(CLR_BG)).show(ctx, |ui| {
                 self.draw_login(ui, ctx);
@@ -874,12 +911,10 @@ impl eframe::App for App {
             return;
         }
 
-        // Авто-подключение если имя есть, но ещё не подключены
         if !self.is_connected && self.event_rx.is_none() {
             self.connect_register();
         }
 
-        // Если идёт активный звонок / исходящий / входящий — показываем экран звонка
         match self.call_state.clone() {
             CallState::Calling { target_code: _, target_name } => {
                 egui::CentralPanel::default().frame(egui::Frame::none().fill(CLR_BG)).show(ctx, |ui| {
@@ -905,19 +940,16 @@ impl eframe::App for App {
             CallState::None => {}
         }
 
-        // Верхняя панель навигации (Чистая вкладка без костылей)
         egui::TopBottomPanel::top("topbar")
             .frame(egui::Frame::none().fill(CLR_SURFACE).inner_margin(egui::Margin::symmetric(12.0, 8.0)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    // Логотип + Имя
                     draw_chebu_icon(ui, 26.0);
                     ui.add_space(4.0);
                     ui.label(egui::RichText::new("Cheburgram").size(15.0).strong().color(CLR_ACCENT));
 
                     ui.add_space(16.0);
 
-                    // Вкладки навигации
                     let tab_btn = |ui: &mut egui::Ui, current: Tab, target: Tab, text: &str| -> bool {
                         let is_sel = current == target;
                         let bg = if is_sel { CLR_SURFACE2 } else { egui::Color32::TRANSPARENT };
@@ -940,7 +972,6 @@ impl eframe::App for App {
                 });
             });
 
-        // Нижняя строка статуса
         egui::TopBottomPanel::bottom("statusbar")
             .frame(egui::Frame::none().fill(CLR_SURFACE).inner_margin(egui::Margin::symmetric(12.0, 4.0)))
             .show(ctx, |ui| {
@@ -952,7 +983,6 @@ impl eframe::App for App {
                 });
             });
 
-        // Центральная панель по выбранной вкладке
         egui::CentralPanel::default().frame(egui::Frame::none().fill(CLR_BG)).show(ctx, |ui| {
             match self.active_tab {
                 Tab::Contacts => self.draw_contacts(ui, ctx),
@@ -1035,90 +1065,132 @@ impl App {
     fn draw_contacts(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.add_space(8.0);
 
-        // Карточка "Мой ID"
-        egui::Frame::none()
-            .fill(CLR_SURFACE)
-            .rounding(egui::Rounding::same(10.0))
-            .stroke(egui::Stroke::new(1.0, CLR_BORDER))
-            .inner_margin(egui::Margin::symmetric(14.0, 10.0))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Мой ID:").color(CLR_TEXT_DIM));
-                    ui.label(
-                        egui::RichText::new(&self.cfg.user_code)
-                            .size(17.0)
-                            .strong()
-                            .color(CLR_ACCENT)
-                            .font(egui::FontId::monospace(17.0)),
-                    );
+        // Вся страница масштабируется адаптируемо под ширину окна
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            // Карточка "Мой ID"
+            egui::Frame::none()
+                .fill(CLR_SURFACE)
+                .rounding(egui::Rounding::same(10.0))
+                .stroke(egui::Stroke::new(1.0, CLR_BORDER))
+                .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Мой ID:").color(CLR_TEXT_DIM));
+                        ui.label(
+                            egui::RichText::new(&self.cfg.user_code)
+                                .size(17.0)
+                                .strong()
+                                .color(CLR_ACCENT)
+                                .font(egui::FontId::monospace(17.0)),
+                        );
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let btn_text = if self.copied_code_banner { "Скопировано!" } else { "📋 Скопировать" };
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let btn_text = if self.copied_code_banner { "Скопировано!" } else { "📋 Скопировать" };
+                            if ui.add(egui::Button::new(
+                                egui::RichText::new(btn_text).small().color(CLR_TEXT)
+                            ).fill(CLR_SURFACE2)).clicked() {
+                                ctx.output_mut(|o| o.copied_text = self.cfg.user_code.clone());
+                                self.copied_code_banner = true;
+                            }
+                        });
+                    });
+                });
+
+            ui.add_space(8.0);
+
+            // Форма отправки запроса в друзья
+            egui::Frame::none()
+                .fill(CLR_SURFACE)
+                .rounding(egui::Rounding::same(10.0))
+                .stroke(egui::Stroke::new(1.0, CLR_BORDER))
+                .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("➕ Запрос по ID:").color(CLR_TEXT_DIM));
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.add_friend_input)
+                                .hint_text("6 цифр")
+                                .desired_width(100.0)
+                                .font(egui::FontId::monospace(14.0))
+                                .text_color(CLR_TEXT)
+                        );
+                        if resp.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            let code = self.add_friend_input.clone();
+                            self.send_friend_request(&code);
+                        }
+
                         if ui.add(egui::Button::new(
-                            egui::RichText::new(btn_text).small().color(CLR_TEXT)
-                        ).fill(CLR_SURFACE2)).clicked() {
-                            ctx.output_mut(|o| o.copied_text = self.cfg.user_code.clone());
-                            self.copied_code_banner = true;
+                            egui::RichText::new("Отправить запрос").strong().color(egui::Color32::WHITE)
+                        ).fill(CLR_ACCENT)).clicked() {
+                            let code = self.add_friend_input.clone();
+                            self.send_friend_request(&code);
                         }
                     });
                 });
-            });
 
-        ui.add_space(8.0);
-
-        // Форма добавления друга по ID
-        egui::Frame::none()
-            .fill(CLR_SURFACE)
-            .rounding(egui::Rounding::same(10.0))
-            .stroke(egui::Stroke::new(1.0, CLR_BORDER))
-            .inner_margin(egui::Margin::symmetric(14.0, 10.0))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("➕ Добавить по ID:").color(CLR_TEXT_DIM));
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.add_friend_input)
-                            .hint_text("6 цифр")
-                            .desired_width(90.0)
-                            .font(egui::FontId::monospace(14.0))
-                            .text_color(CLR_TEXT)
-                    );
-                    if resp.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        let code = self.add_friend_input.clone();
-                        self.add_friend_by_code(&code);
-                    }
-
-                    if ui.add(egui::Button::new(
-                        egui::RichText::new("Найти").strong().color(egui::Color32::WHITE)
-                    ).fill(CLR_ACCENT)).clicked() {
-                        let code = self.add_friend_input.clone();
-                        self.add_friend_by_code(&code);
-                    }
-                });
-            });
-
-        ui.add_space(10.0);
-        ui.label(egui::RichText::new("Мои контакты").size(15.0).strong().color(CLR_TEXT));
-        ui.add_space(4.0);
-
-        if self.cfg.friends.is_empty() {
-            ui.vertical_centered(|ui| {
-                ui.add_space(40.0);
-                ui.label(egui::RichText::new("Список контактов пуст").size(16.0).color(CLR_TEXT_DIM));
+            // Входящие запросы в друзья
+            if !self.pending_friend_requests.is_empty() {
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("📩 Запросы в друзья").size(15.0).strong().color(CLR_ACCENT));
                 ui.add_space(4.0);
-                ui.label(egui::RichText::new("Введите 6-значный ID друга выше, чтобы добавить его")
-                    .small().color(CLR_TEXT_DIM));
-            });
-            return;
-        }
 
-        let friends = self.cfg.friends.clone();
-        let statuses = self.friend_statuses.clone();
-        let mut call_action: Option<(String, String)> = None;
-        let mut remove_action: Option<String> = None;
+                let requests = self.pending_friend_requests.clone();
+                for req in &requests {
+                    egui::Frame::none()
+                        .fill(CLR_SURFACE)
+                        .rounding(egui::Rounding::same(10.0))
+                        .stroke(egui::Stroke::new(1.0, CLR_ACCENT))
+                        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.label(egui::RichText::new(&req.from_name).size(15.0).strong().color(CLR_TEXT));
+                                    ui.label(egui::RichText::new(format!("ID: {}", req.from_code)).small().color(CLR_TEXT_DIM));
+                                });
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let fc1 = req.from_code.clone();
+                                    if ui.add(egui::Button::new(
+                                        egui::RichText::new("Принять").strong().color(egui::Color32::WHITE)
+                                    ).fill(CLR_GREEN)).clicked() {
+                                        self.accept_friend_request(fc1);
+                                    }
+                                    ui.add_space(4.0);
+                                    let fc2 = req.from_code.clone();
+                                    if ui.add(egui::Button::new(
+                                        egui::RichText::new("Отклонить").color(CLR_TEXT)
+                                    ).fill(CLR_SURFACE2)).clicked() {
+                                        self.reject_friend_request(fc2);
+                                    }
+                                });
+                            });
+                        });
+                    ui.add_space(4.0);
+                }
+            }
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new("Мои друзья").size(15.0).strong().color(CLR_TEXT));
+            ui.add_space(4.0);
+
+            if self.cfg.friends.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(30.0);
+                    ui.label(egui::RichText::new("Список друзей пуст").size(16.0).color(CLR_TEXT_DIM));
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Введите 6-значный ID друга выше, чтобы отправить запрос")
+                        .small().color(CLR_TEXT_DIM));
+                });
+                return;
+            }
+
+            let friends = self.cfg.friends.clone();
+            let statuses = self.friend_statuses.clone();
+            let mut call_action: Option<(String, String)> = None;
+            let mut remove_action: Option<String> = None;
+
             for f in &friends {
                 let st = statuses.get(&f.user_code);
                 let is_online = st.map(|s| s.is_online).unwrap_or(false);
@@ -1131,7 +1203,6 @@ impl App {
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
-                            // Аватар
                             let col = name_color(&f.name);
                             let (rect, _) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
                             ui.painter().circle_filled(rect.center(), 20.0, col);
@@ -1152,7 +1223,6 @@ impl App {
                             });
 
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                // Удалить контакт
                                 if ui.add(egui::Button::new(
                                     egui::RichText::new("🗑").small().color(CLR_TEXT_DIM)
                                 ).fill(egui::Color32::TRANSPARENT)).clicked() {
@@ -1161,7 +1231,6 @@ impl App {
 
                                 ui.add_space(4.0);
 
-                                // Позвонить
                                 let btn = egui::Button::new(
                                     egui::RichText::new("Позвонить").strong().color(egui::Color32::WHITE)
                                 ).fill(if is_online { CLR_GREEN } else { CLR_SURFACE2 });
@@ -1174,176 +1243,207 @@ impl App {
                     });
                 ui.add_space(6.0);
             }
-        });
 
-        if let Some(code) = remove_action {
-            self.cfg.friends.retain(|f| f.user_code != code);
-            self.friend_statuses.remove(&code);
-            save_config(&self.cfg);
-            self.status = "Контакт удалён".into();
-        }
+            if let Some(code) = remove_action {
+                self.cfg.friends.retain(|f| f.user_code != code);
+                self.friend_statuses.remove(&code);
+                save_config(&self.cfg);
+                self.status = "Контакт удалён".into();
+            }
 
-        if let Some((code, name)) = call_action {
-            self.call_user(code, name);
-        }
-    }
-
-    fn draw_calling(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, to_name: &str) {
-        ui.vertical_centered(|ui| {
-            ui.add_space(60.0);
-
-            let t = ctx.input(|i| i.time) as f32;
-            let pulse = ((t * 2.5).sin() * 0.15 + 0.85) as f32;
-            let col = name_color(to_name);
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(80.0, 80.0), egui::Sense::hover());
-            ui.painter().circle_filled(rect.center(), 40.0 * pulse, col.gamma_multiply(0.3));
-            ui.painter().circle_filled(rect.center(), 40.0, col);
-            let first = to_name.chars().next().unwrap_or('?').to_uppercase().next().unwrap_or('?');
-            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
-                first.to_string(), egui::FontId::proportional(38.0), egui::Color32::WHITE);
-
-            ui.add_space(16.0);
-            ui.label(egui::RichText::new(to_name).size(22.0).strong().color(CLR_TEXT));
-            ui.add_space(6.0);
-            let dots = match ((t * 2.0) as u32) % 4 { 0 => ".", 1 => "..", 2 => "...", _ => "" };
-            ui.label(egui::RichText::new(format!("Вызов{}", dots)).color(CLR_TEXT_DIM));
-            ui.add_space(36.0);
-
-            if ui.add(egui::Button::new(
-                egui::RichText::new("Отмена").strong().color(egui::Color32::WHITE)
-            ).fill(CLR_RED).min_size(egui::vec2(140.0, 42.0))).clicked() {
-                self.end_call();
+            if let Some((code, name)) = call_action {
+                self.call_user(code, name);
             }
         });
     }
 
+    fn draw_calling(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, to_name: &str) {
+        let avail = ui.available_size();
+        let target_w = (340.0f32).min(avail.x - 20.0);
+        ui.allocate_ui_at_rect(
+            egui::Rect::from_center_size(
+                ui.min_rect().center(),
+                egui::vec2(target_w, avail.y),
+            ),
+            |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
+
+                    let t = ctx.input(|i| i.time) as f32;
+                    let pulse = ((t * 2.5).sin() * 0.15 + 0.85) as f32;
+                    let col = name_color(to_name);
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(80.0, 80.0), egui::Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 40.0 * pulse, col.gamma_multiply(0.3));
+                    ui.painter().circle_filled(rect.center(), 40.0, col);
+                    let first = to_name.chars().next().unwrap_or('?').to_uppercase().next().unwrap_or('?');
+                    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
+                        first.to_string(), egui::FontId::proportional(38.0), egui::Color32::WHITE);
+
+                    ui.add_space(16.0);
+                    ui.label(egui::RichText::new(to_name).size(22.0).strong().color(CLR_TEXT));
+                    ui.add_space(6.0);
+                    let dots = match ((t * 2.0) as u32) % 4 { 0 => ".", 1 => "..", 2 => "...", _ => "" };
+                    ui.label(egui::RichText::new(format!("Вызов{}", dots)).color(CLR_TEXT_DIM));
+                    ui.add_space(36.0);
+
+                    if ui.add(egui::Button::new(
+                        egui::RichText::new("Отмена").strong().color(egui::Color32::WHITE)
+                    ).fill(CLR_RED).min_size(egui::vec2(140.0, 42.0))).clicked() {
+                        self.end_call();
+                    }
+                });
+            }
+        );
+    }
+
     fn draw_incoming(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, from_peer_id: u32, from_name: &str) {
-        ui.vertical_centered(|ui| {
-            ui.add_space(50.0);
+        let avail = ui.available_size();
+        let target_w = (340.0f32).min(avail.x - 20.0);
+        ui.allocate_ui_at_rect(
+            egui::Rect::from_center_size(
+                ui.min_rect().center(),
+                egui::vec2(target_w, avail.y),
+            ),
+            |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
 
-            let t = ctx.input(|i| i.time) as f32;
-            let pulse = ((t * 3.0).sin() * 0.2 + 0.8) as f32;
-            let col = name_color(from_name);
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(90.0, 90.0), egui::Sense::hover());
-            ui.painter().circle_filled(rect.center(), 45.0 * pulse, CLR_ACCENT.gamma_multiply(0.25));
-            ui.painter().circle_filled(rect.center(), 45.0, col);
-            let first = from_name.chars().next().unwrap_or('?').to_uppercase().next().unwrap_or('?');
-            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
-                first.to_string(), egui::FontId::proportional(44.0), egui::Color32::WHITE);
+                    let t = ctx.input(|i| i.time) as f32;
+                    let pulse = ((t * 3.0).sin() * 0.2 + 0.8) as f32;
+                    let col = name_color(from_name);
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(90.0, 90.0), egui::Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 45.0 * pulse, CLR_ACCENT.gamma_multiply(0.25));
+                    ui.painter().circle_filled(rect.center(), 45.0, col);
+                    let first = from_name.chars().next().unwrap_or('?').to_uppercase().next().unwrap_or('?');
+                    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
+                        first.to_string(), egui::FontId::proportional(44.0), egui::Color32::WHITE);
 
-            ui.add_space(14.0);
-            ui.label(egui::RichText::new("Входящий звонок").small().color(CLR_TEXT_DIM));
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new(from_name).size(26.0).strong().color(CLR_TEXT));
-            ui.add_space(32.0);
+                    ui.add_space(14.0);
+                    ui.label(egui::RichText::new("Входящий звонок").small().color(CLR_TEXT_DIM));
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(from_name).size(26.0).strong().color(CLR_TEXT));
+                    ui.add_space(32.0);
 
-            ui.horizontal(|ui| {
-                ui.add_space(30.0);
-                let fn_clone = from_name.to_string();
-                if ui.add(egui::Button::new(
-                    egui::RichText::new("Принять").strong().color(egui::Color32::WHITE)
-                ).fill(CLR_GREEN).min_size(egui::vec2(120.0, 44.0))).clicked() {
-                    self.accept_call(from_peer_id, fn_clone);
-                }
-                ui.add_space(16.0);
-                let fn2 = from_name.to_string();
-                if ui.add(egui::Button::new(
-                    egui::RichText::new("Отклонить").strong().color(egui::Color32::WHITE)
-                ).fill(CLR_RED).min_size(egui::vec2(120.0, 44.0))).clicked() {
-                    self.reject_call(from_peer_id, &fn2);
-                }
-            });
-        });
+                    ui.horizontal(|ui| {
+                        let fn_clone = from_name.to_string();
+                        if ui.add(egui::Button::new(
+                            egui::RichText::new("Принять").strong().color(egui::Color32::WHITE)
+                        ).fill(CLR_GREEN).min_size(egui::vec2(130.0, 44.0))).clicked() {
+                            self.accept_call(from_peer_id, fn_clone);
+                        }
+                        ui.add_space(16.0);
+                        let fn2 = from_name.to_string();
+                        if ui.add(egui::Button::new(
+                            egui::RichText::new("Отклонить").strong().color(egui::Color32::WHITE)
+                        ).fill(CLR_RED).min_size(egui::vec2(130.0, 44.0))).clicked() {
+                            self.reject_call(from_peer_id, &fn2);
+                        }
+                    });
+                });
+            }
+        );
     }
 
     fn draw_in_call(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context,
         _peer_id: u32, peer_name: &str, started_at: Instant, _call_id: u64)
     {
-        ui.vertical_centered(|ui| {
-            ui.add_space(16.0);
+        let avail = ui.available_size();
+        let target_w = (340.0f32).min(avail.x - 20.0);
+        ui.allocate_ui_at_rect(
+            egui::Rect::from_center_size(
+                ui.min_rect().center(),
+                egui::vec2(target_w, avail.y),
+            ),
+            |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(16.0);
 
-            let col = name_color(peer_name);
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(68.0, 68.0), egui::Sense::hover());
-            ui.painter().circle_filled(rect.center(), 34.0, col);
-            let first = peer_name.chars().next().unwrap_or('?').to_uppercase().next().unwrap_or('?');
-            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
-                first.to_string(), egui::FontId::proportional(34.0), egui::Color32::WHITE);
-
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new(peer_name).size(20.0).strong().color(CLR_TEXT));
-
-            let el = started_at.elapsed().as_secs();
-            ui.label(egui::RichText::new(format!("{:02}:{:02}", el / 60, el % 60))
-                .size(13.0).color(CLR_TEXT_DIM));
-
-            ui.add_space(20.0);
-
-            egui::Frame::none()
-                .fill(CLR_SURFACE)
-                .rounding(egui::Rounding::same(10.0))
-                .inner_margin(egui::Margin::same(14.0))
-                .show(ui, |ui| {
-                    ui.set_width(300.0);
-                    let lvl = self.mic_level.load(Ordering::Relaxed);
-                    let val = lvl as f32 / 100.0;
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Микрофон").small().color(CLR_TEXT_DIM));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let active_col = if lvl > 5 { CLR_GREEN } else { CLR_TEXT_DIM };
-                            ui.label(egui::RichText::new(format!("{}%", lvl)).small().color(active_col));
-                        });
-                    });
-                    ui.add_space(4.0);
-
-                    let (vu_rect, _) = ui.allocate_exact_size(egui::vec2(272.0, 12.0), egui::Sense::hover());
-                    ui.painter().rect_filled(vu_rect, egui::Rounding::same(6.0), CLR_SURFACE2);
-                    let fill_w = (vu_rect.width() * val).max(0.0);
-                    if fill_w > 0.0 {
-                        let fill_rect = egui::Rect::from_min_size(vu_rect.min, egui::vec2(fill_w, vu_rect.height()));
-                        let bar_col = if val > 0.8 { CLR_RED } else if val > 0.5 { CLR_ACCENT } else { CLR_GREEN };
-                        ui.painter().rect_filled(fill_rect, egui::Rounding::same(6.0), bar_col);
-                    }
+                    let col = name_color(peer_name);
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(68.0, 68.0), egui::Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 34.0, col);
+                    let first = peer_name.chars().next().unwrap_or('?').to_uppercase().next().unwrap_or('?');
+                    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
+                        first.to_string(), egui::FontId::proportional(34.0), egui::Color32::WHITE);
 
                     ui.add_space(8.0);
-                    let s = self.pkts_sent.load(Ordering::Relaxed);
-                    let r = self.pkts_recv.load(Ordering::Relaxed);
-                    ui.label(egui::RichText::new(format!("Отпр: {}  Получ: {}", s, r))
-                        .small().color(CLR_TEXT_DIM));
+                    ui.label(egui::RichText::new(peer_name).size(20.0).strong().color(CLR_TEXT));
+
+                    let el = started_at.elapsed().as_secs();
+                    ui.label(egui::RichText::new(format!("{:02}:{:02}", el / 60, el % 60))
+                        .size(13.0).color(CLR_TEXT_DIM));
+
+                    ui.add_space(20.0);
+
+                    // Адаптивная карточка VU метра
+                    egui::Frame::none()
+                        .fill(CLR_SURFACE)
+                        .rounding(egui::Rounding::same(10.0))
+                        .inner_margin(egui::Margin::same(14.0))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            let lvl = self.mic_level.load(Ordering::Relaxed);
+                            let val = lvl as f32 / 100.0;
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("Микрофон").small().color(CLR_TEXT_DIM));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let active_col = if lvl > 5 { CLR_GREEN } else { CLR_TEXT_DIM };
+                                    ui.label(egui::RichText::new(format!("{}%", lvl)).small().color(active_col));
+                                });
+                            });
+                            ui.add_space(4.0);
+
+                            let (vu_rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 12.0), egui::Sense::hover());
+                            ui.painter().rect_filled(vu_rect, egui::Rounding::same(6.0), CLR_SURFACE2);
+                            let fill_w = (vu_rect.width() * val).max(0.0);
+                            if fill_w > 0.0 {
+                                let fill_rect = egui::Rect::from_min_size(vu_rect.min, egui::vec2(fill_w, vu_rect.height()));
+                                let bar_col = if val > 0.8 { CLR_RED } else if val > 0.5 { CLR_ACCENT } else { CLR_GREEN };
+                                ui.painter().rect_filled(fill_rect, egui::Rounding::same(6.0), bar_col);
+                            }
+
+                            ui.add_space(8.0);
+                            let s = self.pkts_sent.load(Ordering::Relaxed);
+                            let r = self.pkts_recv.load(Ordering::Relaxed);
+                            ui.label(egui::RichText::new(format!("Отпр: {}  Получ: {}", s, r))
+                                .small().color(CLR_TEXT_DIM));
+                        });
+
+                    ui.add_space(16.0);
+
+                    // Кнопки управления вызовом
+                    egui::Frame::none()
+                        .fill(CLR_SURFACE)
+                        .rounding(egui::Rounding::same(10.0))
+                        .inner_margin(egui::Margin::same(14.0))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                let mic_txt = if self.mic_muted { "Мик ВЫКЛ" } else { "Мик вкл" };
+                                let mic_col = if self.mic_muted { egui::Color32::from_rgb(80, 30, 30) } else { CLR_SURFACE2 };
+                                if ui.add(egui::Button::new(
+                                    egui::RichText::new(mic_txt).color(CLR_TEXT).strong()
+                                ).fill(mic_col).min_size(egui::vec2(80.0, 34.0))).clicked() {
+                                    self.mic_muted = !self.mic_muted;
+                                }
+
+                                let spk_txt = if self.snd_muted { "Звук ВЫКЛ" } else { "Звук вкл" };
+                                let spk_col = if self.snd_muted { egui::Color32::from_rgb(80, 30, 30) } else { CLR_SURFACE2 };
+                                if ui.add(egui::Button::new(
+                                    egui::RichText::new(spk_txt).color(CLR_TEXT).strong()
+                                ).fill(spk_col).min_size(egui::vec2(80.0, 34.0))).clicked() {
+                                    self.snd_muted = !self.snd_muted;
+                                }
+
+                                if ui.add(egui::Button::new(
+                                    egui::RichText::new("Завершить").strong().color(egui::Color32::WHITE)
+                                ).fill(CLR_RED).min_size(egui::vec2(90.0, 34.0))).clicked() {
+                                    self.end_call();
+                                }
+                            });
+                        });
                 });
-
-            ui.add_space(16.0);
-
-            egui::Frame::none()
-                .fill(CLR_SURFACE)
-                .rounding(egui::Rounding::same(10.0))
-                .inner_margin(egui::Margin::same(14.0))
-                .show(ui, |ui| {
-                    ui.set_width(300.0);
-                    ui.horizontal(|ui| {
-                        let mic_txt = if self.mic_muted { "Мик ВЫКЛ" } else { "Мик вкл" };
-                        let mic_col = if self.mic_muted { egui::Color32::from_rgb(80, 30, 30) } else { CLR_SURFACE2 };
-                        if ui.add(egui::Button::new(
-                            egui::RichText::new(mic_txt).color(CLR_TEXT).strong()
-                        ).fill(mic_col).min_size(egui::vec2(90.0, 34.0))).clicked() {
-                            self.mic_muted = !self.mic_muted;
-                        }
-
-                        let spk_txt = if self.snd_muted { "Звук ВЫКЛ" } else { "Звук вкл" };
-                        let spk_col = if self.snd_muted { egui::Color32::from_rgb(80, 30, 30) } else { CLR_SURFACE2 };
-                        if ui.add(egui::Button::new(
-                            egui::RichText::new(spk_txt).color(CLR_TEXT).strong()
-                        ).fill(spk_col).min_size(egui::vec2(90.0, 34.0))).clicked() {
-                            self.snd_muted = !self.snd_muted;
-                        }
-
-                        if ui.add(egui::Button::new(
-                            egui::RichText::new("Завершить").strong().color(egui::Color32::WHITE)
-                        ).fill(CLR_RED).min_size(egui::vec2(90.0, 34.0))).clicked() {
-                            self.end_call();
-                        }
-                    });
-                });
-        });
+            }
+        );
     }
 
     fn draw_history(&self, ui: &mut egui::Ui) {
@@ -1359,7 +1459,7 @@ impl App {
             return;
         }
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for r in &self.cfg.call_history {
                 egui::Frame::none()
                     .fill(CLR_SURFACE)
@@ -1399,8 +1499,7 @@ impl App {
         ui.label(egui::RichText::new("Настройки").size(15.0).strong().color(CLR_TEXT));
         ui.add_space(10.0);
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            // Профиль
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             settings_section(ui, "Профиль", |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Имя:").color(CLR_TEXT_DIM));
@@ -1428,7 +1527,6 @@ impl App {
 
             ui.add_space(8.0);
 
-            // Соединение
             settings_section(ui, "Сервер", |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Адрес:").color(CLR_TEXT_DIM));
@@ -1445,8 +1543,7 @@ impl App {
 
             ui.add_space(8.0);
 
-            // Аудио
-            settings_section(ui, "Аудио устрйства", |ui| {
+            settings_section(ui, "Аудио устройства", |ui| {
                 let prev_in = self.devs.sel_in;
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Микрофон:").color(CLR_TEXT_DIM));
@@ -1513,6 +1610,38 @@ impl App {
                     save_config(&self.cfg);
                     self.status = "Настройки аудио сохранены".into();
                 }
+            });
+
+            ui.add_space(8.0);
+
+            // Масштабирование интерфейса
+            settings_section(ui, "Масштаб интерфейса", |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Размер UI:").color(CLR_TEXT_DIM));
+                    let old_zoom = self.cfg.zoom_factor;
+                    if ui.add(egui::Slider::new(&mut self.cfg.zoom_factor, 0.8..=1.6).text("x")).changed() {
+                        save_config(&self.cfg);
+                    }
+                    let _ = old_zoom;
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let btn_scale = |ui: &mut egui::Ui, cfg: &mut AppConfig, scale: f32, label: &str| {
+                        let is_active = (cfg.zoom_factor - scale).abs() < 0.05;
+                        let bg = if is_active { CLR_ACCENT } else { CLR_SURFACE2 };
+                        if ui.add(egui::Button::new(
+                            egui::RichText::new(label).color(egui::Color32::WHITE)
+                        ).fill(bg)).clicked() {
+                            cfg.zoom_factor = scale;
+                            save_config(cfg);
+                        }
+                    };
+
+                    btn_scale(ui, &mut self.cfg, 0.8, "80%");
+                    btn_scale(ui, &mut self.cfg, 1.0, "100%");
+                    btn_scale(ui, &mut self.cfg, 1.25, "125%");
+                    btn_scale(ui, &mut self.cfg, 1.5, "150%");
+                });
             });
         });
     }
@@ -1670,7 +1799,7 @@ fn make_app_icon() -> egui::IconData {
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    info!("Cheburgram v2.2 запуск...");
+    info!("Cheburgram v2.3 запуск...");
 
     setup_autostart();
 
@@ -1687,7 +1816,40 @@ fn main() -> Result<()> {
     eframe::run_native("Cheburgram", options,
         Box::new(|cc| {
             setup_fonts(&cc.egui_ctx);
-            Box::new(App::default())
+            let app = App::default();
+            let egui_ctx = cc.egui_ctx.clone();
+            let open_id = app.tray_open_id.clone();
+            let quit_id = app.tray_quit_id.clone();
+
+            thread::spawn(move || {
+                let menu_rx = MenuEvent::receiver();
+                let tray_rx = TrayIconEvent::receiver();
+                loop {
+                    let mut wake = false;
+                    while let Ok(ev) = menu_rx.try_recv() {
+                        if quit_id.as_ref().map(|id| *id == ev.id).unwrap_or(false) {
+                            std::process::exit(0);
+                        }
+                        if open_id.as_ref().map(|id| *id == ev.id).unwrap_or(true) {
+                            wake = true;
+                        }
+                    }
+                    while let Ok(_ev) = tray_rx.try_recv() {
+                        wake = true;
+                    }
+
+                    if wake {
+                        egui_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        egui_ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                        egui_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        egui_ctx.request_repaint();
+                    }
+
+                    thread::sleep(Duration::from_millis(50));
+                }
+            });
+
+            Box::new(app)
         }),
     ).map_err(|e| anyhow!("GUI: {}", e))?;
     Ok(())

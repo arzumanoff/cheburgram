@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use cheburgram_protocol::{AudioPacket, ControlMessage, FriendStatus};
+use cheburgram_protocol::{AudioPacket, ControlMessage, FriendRequestInfo, FriendStatus};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     sync::Arc,
 };
@@ -17,12 +17,15 @@ const TCP_SIGNAL_PORT: u16 = 7878;
 const UDP_MEDIA_PORT: u16 = 7879;
 const CLIENTS_FILE: &str = "clients.json";
 
-// ─── Постоянный реестр клиентов (на диске VPS) ────────────────────────────────
+// ─── Реестр клиентов (на диске VPS) ───────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ClientRegistry {
     /// user_code (6 цифр) → запись
     clients: HashMap<String, RegistryEntry>,
+    /// target_user_code → набор from_user_codes (входящие запросы)
+    #[serde(default)]
+    pending_requests: HashMap<String, HashSet<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,7 +66,6 @@ impl ClientRegistry {
         let code = if user_code.len() == 6 && user_code.chars().all(|c| c.is_ascii_digit()) {
             user_code.to_string()
         } else {
-            // Ищем по client_id
             if let Some((existing_code, _)) = self.clients.iter().find(|(_, v)| v.client_id == client_id) {
                 existing_code.clone()
             } else {
@@ -85,7 +87,7 @@ impl ClientRegistry {
     }
 }
 
-// ─── Состояние онлайн ─────────────────────────────────────────────────────────
+// ─── Состояние ────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 struct OnlineUser {
@@ -100,14 +102,10 @@ struct OnlineUser {
 
 #[derive(Debug, Default)]
 struct State {
-    /// peer_id → OnlineUser
     online_by_peer: HashMap<u32, OnlineUser>,
-    /// user_code → peer_id
     online_by_code: HashMap<String, u32>,
-
     next_peer_id: u32,
     next_call_id: u64,
-    /// call_id → (peer_id_a, peer_id_b)
     active_calls: HashMap<u64, (u32, u32)>,
 }
 
@@ -132,9 +130,9 @@ type SharedState = Arc<Mutex<State>>;
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    info!("🚀 Запуск Cheburgram Server v2.2 (ID/Друзья)...");
-    info!("   TCP сигналы: 0.0.0.0:{}", TCP_SIGNAL_PORT);
-    info!("   UDP медиа:   0.0.0.0:{}", UDP_MEDIA_PORT);
+    info!("🚀 Cheburgram Server v2.3 (CallID Fix + Friend Requests)...");
+    info!("   TCP: 0.0.0.0:{}", TCP_SIGNAL_PORT);
+    info!("   UDP: 0.0.0.0:{}", UDP_MEDIA_PORT);
 
     let registry = Arc::new(Mutex::new(ClientRegistry::load()));
     info!("📋 Загружен реестр: {} пользователей", registry.lock().await.clients.len());
@@ -183,6 +181,10 @@ async fn main() -> Result<()> {
                                     });
                                 }
                             }
+                        } else {
+                            // Лог для отладки
+                            info!("⚠️ UDP packet ignored: call_id={} not active (active: {:?})",
+                                  call_id, st.active_calls.keys().collect::<Vec<_>>());
                         }
                     }
                 }
@@ -219,7 +221,6 @@ async fn handle_client(
 
     let (tx, mut rx) = mpsc::unbounded_channel::<ControlMessage>();
 
-    // Отправка сообщений клиенту по ЕДИНОМУ TCP каналу
     let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if let Ok(json) = serde_json::to_string(&msg) {
@@ -274,34 +275,108 @@ async fn handle_client(
                     udp_port: UDP_MEDIA_PORT,
                 });
 
+                // Отправляем входящие запросы в друзья
+                {
+                    let reg = registry.lock().await;
+                    if let Some(set) = reg.pending_requests.get(&code) {
+                        let requests: Vec<FriendRequestInfo> = set.iter().filter_map(|from_code| {
+                            reg.clients.get(from_code).map(|entry| FriendRequestInfo {
+                                from_code: from_code.clone(),
+                                from_name: entry.name.clone(),
+                            })
+                        }).collect();
+                        if !requests.is_empty() {
+                            let _ = tx.send(ControlMessage::PendingFriendRequests { requests });
+                        }
+                    }
+                }
+
                 st.broadcast_status(&code, true, Some(peer_id));
             }
 
-            ControlMessage::LookupUser { user_code } => {
-                let reg = registry.lock().await;
-                let code_clean = user_code.trim().to_string();
-                if let Some(entry) = reg.clients.get(&code_clean) {
-                    let st = state.lock().await;
-                    let (is_online, peer_id) = match st.online_by_code.get(&code_clean) {
-                        Some(&pid) => (true, Some(pid)),
-                        None => (false, None),
-                    };
-                    let _ = tx.send(ControlMessage::UserLookupResult {
-                        found: true,
-                        user_code: code_clean,
-                        name: entry.name.clone(),
-                        is_online,
-                        peer_id,
+            ControlMessage::SendFriendRequest { target_code } => {
+                let target_clean = target_code.trim().to_string();
+                let my_code = match &my_user_code {
+                    Some(c) => c.clone(),
+                    None => continue,
+                };
+
+                let (target_exists, from_name) = {
+                    let mut reg = registry.lock().await;
+                    let exists = reg.clients.contains_key(&target_clean);
+                    let name = reg.clients.get(&my_code).map(|e| e.name.clone()).unwrap_or_default();
+                    if exists {
+                        reg.pending_requests.entry(target_clean.clone()).or_default().insert(my_code.clone());
+                        reg.save();
+                    }
+                    (exists, name)
+                };
+
+                if !target_exists {
+                    let _ = tx.send(ControlMessage::Error {
+                        message: format!("Пользователь с ID {} не найден", target_clean),
                     });
                 } else {
-                    let _ = tx.send(ControlMessage::UserLookupResult {
-                        found: false,
-                        user_code: code_clean,
-                        name: String::new(),
-                        is_online: false,
-                        peer_id: None,
+                    let st = state.lock().await;
+                    if let Some(&target_peer) = st.online_by_code.get(&target_clean) {
+                        if let Some(target_user) = st.online_by_peer.get(&target_peer) {
+                            let _ = target_user.tx.send(ControlMessage::IncomingFriendRequest {
+                                from_code: my_code.clone(),
+                                from_name: from_name.clone(),
+                            });
+                        }
+                    }
+                    let _ = tx.send(ControlMessage::Error {
+                        message: format!("Запрос в друзья отправлен ID {}!", target_clean),
                     });
                 }
+            }
+
+            ControlMessage::AcceptFriendRequest { from_code } => {
+                let my_code = match &my_user_code {
+                    Some(c) => c.clone(),
+                    None => continue,
+                };
+
+                let (my_name, from_name) = {
+                    let mut reg = registry.lock().await;
+                    if let Some(set) = reg.pending_requests.get_mut(&my_code) {
+                        set.remove(&from_code);
+                    }
+                    reg.save();
+                    let m_name = reg.clients.get(&my_code).map(|e| e.name.clone()).unwrap_or_default();
+                    let f_name = reg.clients.get(&from_code).map(|e| e.name.clone()).unwrap_or_default();
+                    (m_name, f_name)
+                };
+
+                // Подтверждаем принявшему
+                let _ = tx.send(ControlMessage::FriendRequestAccepted {
+                    user_code: from_code.clone(),
+                    name: from_name,
+                });
+
+                // Уведомляем отправителя
+                let st = state.lock().await;
+                if let Some(&sender_peer) = st.online_by_code.get(&from_code) {
+                    if let Some(sender_user) = st.online_by_peer.get(&sender_peer) {
+                        let _ = sender_user.tx.send(ControlMessage::FriendRequestAccepted {
+                            user_code: my_code,
+                            name: my_name,
+                        });
+                    }
+                }
+            }
+
+            ControlMessage::RejectFriendRequest { from_code } => {
+                let my_code = match &my_user_code {
+                    Some(c) => c.clone(),
+                    None => continue,
+                };
+                let mut reg = registry.lock().await;
+                if let Some(set) = reg.pending_requests.get_mut(&my_code) {
+                    set.remove(&from_code);
+                }
+                reg.save();
             }
 
             ControlMessage::GetFriendsStatus { user_codes } => {
@@ -369,7 +444,7 @@ async fn handle_client(
                     None => continue,
                 };
 
-                let call_id = st.next_call_id;
+                let call_id = st.next_call_id + 1; // Уникальный единый call_id для обоих!
                 st.next_call_id += 1;
                 st.active_calls.insert(call_id, (my_id, target_peer_id));
 
@@ -385,17 +460,19 @@ async fn handle_client(
 
                 info!("✅ Call accepted: {} ↔ {} (call_id={})", my_name, target_name, call_id);
 
-                // Уведомляем инициатора
+                // Инициатору отправляем ТАКЖЕ call_id!
                 if let Some(initiator) = st.online_by_peer.get(&target_peer_id) {
                     let _ = initiator.tx.send(ControlMessage::CallAccepted {
                         peer_id: my_id,
                         peer_name: my_name,
+                        call_id,
                     });
                 }
-                // Ответившему
+                // Ответившему отправляем ТАКЖЕ call_id!
                 let _ = tx.send(ControlMessage::CallAccepted {
                     peer_id: target_peer_id,
                     peer_name: target_name,
+                    call_id,
                 });
             }
 
