@@ -480,7 +480,7 @@ impl App {
         self.pkts_recv.store(0, Ordering::Relaxed);
     }
 
-    fn start_audio(&mut self, peer_id: u32, udp_port: u16, call_id: u64) {
+    fn start_audio(&mut self, _peer_id: u32, udp_port: u16, call_id: u64) {
         let server_ip = self.cfg.server_address
             .split(':').next().unwrap_or("85.192.25.57").to_string();
 
@@ -2013,5 +2013,34 @@ fn main() -> Result<()> {
             Box::new(app)
         }),
     ).map_err(|e| anyhow!("GUI: {}", e))?;
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_server_address() {
+        assert_eq!(normalize(""), DEFAULT_SERVER);
+        assert_eq!(normalize("  "), DEFAULT_SERVER);
+        assert_eq!(normalize("85.192.25.57"), "85.192.25.57:7878");
+        assert_eq!(normalize("my-vps.com"), "my-vps.com:7878");
+        assert_eq!(normalize("my-vps.com:9090"), "my-vps.com:9090");
+        assert_eq!(normalize("my-vps.com:22"), "my-vps.com:7878");
+    }
+
+    #[test]
+    fn test_app_config_default_and_serde() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.user_code.len(), 6);
+        assert_eq!(cfg.zoom_factor, 1.0);
+        assert_eq!(cfg.server_address, DEFAULT_SERVER);
+
+        let json = serde_json::to_string(&cfg).unwrap();
+        let decoded: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg.user_code, decoded.user_code);
+        assert_eq!(cfg.client_id, decoded.client_id);
+    }
 }

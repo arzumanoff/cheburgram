@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use cheburgram_protocol::{
     AudioPacket, ControlMessage, FriendRequestInfo, FriendStatus, TextMessage,
 };
@@ -10,10 +10,10 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream, UdpSocket},
+    net::TcpStream,
     sync::{mpsc, Mutex},
 };
-use tracing::{error, info, warn};
+use tracing::info;
 
 pub const TCP_SIGNAL_PORT: u16 = 7878;
 pub const UDP_MEDIA_PORT: u16 = 7879;
@@ -536,4 +536,52 @@ pub async fn handle_client(
 
     send_task.abort();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_registry_generate_code_format() {
+        let reg = ClientRegistry::default();
+        let code = reg.generate_code();
+        assert_eq!(code.len(), 6);
+        assert!(code.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn test_registry_upsert_new_and_existing() {
+        let mut reg = ClientRegistry::default();
+        let client_id = "test-uuid-1";
+
+        let code1 = reg.upsert("", client_id, "ТестИмя");
+        assert_eq!(code1.len(), 6);
+        assert_eq!(reg.clients.len(), 1);
+        assert_eq!(reg.clients.get(&code1).unwrap().name, "ТестИмя");
+
+        let code2 = reg.upsert("", client_id, "ТестИмя2");
+        assert_eq!(code1, code2);
+        assert_eq!(reg.clients.get(&code2).unwrap().name, "ТестИмя2");
+    }
+
+    #[tokio::test]
+    async fn test_state_online_user_tracking() {
+        let mut state = State::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let user = OnlineUser {
+            peer_id: 1,
+            user_code: "111111".to_string(),
+            client_id: "c1".to_string(),
+            name: "User1".to_string(),
+            tx,
+            udp_addr: None,
+            in_call_with: None,
+        };
+        state.online_by_code.insert("111111".to_string(), 1);
+        state.online_by_peer.insert(1, user);
+
+        assert_eq!(state.online_by_code.get("111111"), Some(&1));
+        assert_eq!(state.online_by_peer.get(&1).unwrap().name, "User1");
+    }
 }

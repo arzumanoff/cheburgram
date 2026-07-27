@@ -183,22 +183,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_control_message_serde() {
-        let msg = ControlMessage::SendTextMessage {
-            target_code: "123456".to_string(),
-            text: "Привет, Чебурашка!".to_string(),
-            message_id: "msg-1".to_string(),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let decoded: ControlMessage = serde_json::from_str(&json).unwrap();
-        assert_eq!(msg, decoded);
+    fn test_all_control_messages_serde() {
+        let messages = vec![
+            ControlMessage::Register { client_id: "id1".into(), user_code: "123456".into(), name: "User".into() },
+            ControlMessage::Registered { peer_id: 1, user_code: "123456".into(), udp_port: 7879 },
+            ControlMessage::SendFriendRequest { target_code: "654321".into() },
+            ControlMessage::IncomingFriendRequest { from_code: "654321".into(), from_name: "Friend".into() },
+            ControlMessage::AcceptFriendRequest { from_code: "654321".into() },
+            ControlMessage::RejectFriendRequest { from_code: "654321".into() },
+            ControlMessage::FriendRequestAccepted { user_code: "654321".into(), name: "Friend".into() },
+            ControlMessage::GetFriendsStatus { user_codes: vec!["654321".into()] },
+            ControlMessage::FriendsStatus { friends: vec![FriendStatus { user_code: "654321".into(), name: "Friend".into(), is_online: true, peer_id: Some(2) }] },
+            ControlMessage::PendingFriendRequests { requests: vec![FriendRequestInfo { from_code: "654321".into(), from_name: "Friend".into() }] },
+            ControlMessage::SendTextMessage { target_code: "654321".into(), text: "Hello".into(), message_id: "m1".into() },
+            ControlMessage::IncomingTextMessage { msg: TextMessage { id: "m1".into(), from_code: "654321".into(), from_name: "Friend".into(), to_code: "123456".into(), text: "Hello".into(), timestamp: "2026-01-01T00:00:00Z".into() } },
+            ControlMessage::TextMessageAck { message_id: "m1".into(), delivered: true },
+            ControlMessage::PendingTextMessages { messages: vec![] },
+            ControlMessage::UserStatusChanged { user_code: "654321".into(), is_online: false, peer_id: None },
+            ControlMessage::CallRequest { target_code: "654321".into() },
+            ControlMessage::IncomingCall { from_code: "654321".into(), from_name: "Friend".into(), from_peer_id: 2 },
+            ControlMessage::CallAccept { target_peer_id: 2 },
+            ControlMessage::CallAccepted { peer_id: 2, peer_name: "Friend".into(), call_id: 100 },
+            ControlMessage::CallReject { target_peer_id: 2 },
+            ControlMessage::CallRejected { peer_id: 2, peer_name: "Friend".into() },
+            ControlMessage::CallEnd,
+            ControlMessage::CallEnded { peer_name: "Friend".into() },
+            ControlMessage::Ping,
+            ControlMessage::Pong,
+            ControlMessage::Error { message: "Fail".into() },
+        ];
+
+        for msg in messages {
+            let json = serde_json::to_string(&msg).unwrap();
+            let decoded: ControlMessage = serde_json::from_str(&json).unwrap();
+            assert_eq!(msg, decoded);
+        }
     }
 
     #[test]
-    fn test_audio_packet_bytes() {
-        let pkt = AudioPacket::new(42, 7, 100, vec![1, 2, 3, 4, 5]);
+    fn test_audio_packet_serde_and_bytes() {
+        let pkt = AudioPacket::new(12345, 99, 500, vec![10, 20, 30, 40, 50]);
         let bytes = pkt.to_bytes().unwrap();
         let decoded = AudioPacket::from_bytes(&bytes).unwrap();
         assert_eq!(pkt, decoded);
+        assert_eq!(decoded.header.room_id, 12345);
+        assert_eq!(decoded.header.sender_id, 99);
+        assert_eq!(decoded.header.sequence, 500);
+        assert_eq!(decoded.payload, vec![10, 20, 30, 40, 50]);
     }
 }

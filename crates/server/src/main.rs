@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use cheburgram_protocol::AudioPacket;
 use cheburgram_server::{
-    handle_client, ClientRegistry, State, SharedState, CLIENTS_FILE, TCP_SIGNAL_PORT, UDP_MEDIA_PORT,
+    handle_client, ClientRegistry, State, SharedState, TCP_SIGNAL_PORT, UDP_MEDIA_PORT,
 };
 use std::sync::Arc;
 use tokio::{
