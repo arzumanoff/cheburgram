@@ -5,7 +5,7 @@ use eframe::egui;
 use opus::{Application, Channels, Decoder, Encoder};
 use ringbuf::HeapRb;
 use std::{
-    io::{BufRead, BufReader, Write},
+    io::Write,
     net::{SocketAddr, TcpStream as StdTcpStream, UdpSocket as StdUdpSocket},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
@@ -139,7 +139,7 @@ impl CheburgramApp {
         self.stop_signal.store(false, Ordering::SeqCst);
 
         let server_addr_str = self.server_address.clone();
-        let (tx, rx) = std::sync::mpsc::channel::<Result<(StdTcpStream, ControlMessage), String>>();
+        let (tx, _rx) = std::sync::mpsc::channel::<Result<(StdTcpStream, ControlMessage), String>>();
 
         // Асинхронное подключение в отдельном потоке
         thread::spawn(move || {
@@ -390,13 +390,13 @@ impl eframe::App for CheburgramApp {
                 ui.heading(
                     egui::RichText::new("🎙 CHEBURGRAM VOICE")
                         .size(24.0)
-                        .bold()
+                        .strong()
                         .color(egui::Color32::from_rgb(255, 140, 0)),
                 );
                 ui.label(
                     egui::RichText::new("Безопасный голосовой созвон 1-на-1")
                         .small()
-                        .italic(),
+                        .italics(),
                 );
                 ui.add_space(15.0);
             });
@@ -407,7 +407,7 @@ impl eframe::App for CheburgramApp {
             match self.app_state {
                 AppState::Disconnected => {
                     ui.group(|ui| {
-                        ui.label(egui::RichText::new("⚙️ Настройки подключения").bold());
+                        ui.label(egui::RichText::new("⚙️ Настройки подключения").strong());
                         ui.add_space(5.0);
 
                         ui.horizontal(|ui| {
@@ -422,7 +422,7 @@ impl eframe::App for CheburgramApp {
                                     .add_sized(
                                         [140.0, 40.0],
                                         egui::Button::new(
-                                            egui::RichText::new("➕ Создать комнату").bold(),
+                                            egui::RichText::new("➕ Создать комнату").strong(),
                                         ),
                                     )
                                     .clicked()
@@ -449,7 +449,7 @@ impl eframe::App for CheburgramApp {
 
                     ui.add_space(15.0);
                     ui.group(|ui| {
-                        ui.label(egui::RichText::new("🎧 Аудио устройства").bold());
+                        ui.label(egui::RichText::new("🎧 Аудио устройства").strong());
                         ui.add_space(5.0);
 
                         ui.horizontal(|ui| {
@@ -492,7 +492,7 @@ impl eframe::App for CheburgramApp {
                                 ui.heading(
                                     egui::RichText::new(&self.current_room)
                                         .size(32.0)
-                                        .bold()
+                                        .strong()
                                         .color(egui::Color32::LIGHT_BLUE),
                                 );
                                 if ui.button("📋").on_hover_text("Копировать").clicked() {
@@ -505,7 +505,7 @@ impl eframe::App for CheburgramApp {
                                 ui.label(
                                     egui::RichText::new("🟢 Собеседник подключен")
                                         .color(egui::Color32::GREEN)
-                                        .bold(),
+                                        .strong(),
                                 );
                             } else {
                                 ui.label(
@@ -551,7 +551,7 @@ impl eframe::App for CheburgramApp {
                                 egui::Button::new(
                                     egui::RichText::new("🔴 Завершить")
                                         .color(egui::Color32::WHITE)
-                                        .bold(),
+                                        .strong(),
                                 )
                                 .fill(egui::Color32::RED),
                             )
