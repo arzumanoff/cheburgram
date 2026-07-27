@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  cheburgram-server:
+    build: .
+    container_name: cheburgram-server
+    restart: always
+    ports:
+      - "7878:7878/tcp"  # TCP Signaling
+      - "7879:7879/udp"  # UDP Media Relay
+    environment:
+      - RUST_LOG=info

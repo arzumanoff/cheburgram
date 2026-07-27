@@ -1,0 +1,17 @@
+[package]
+name = "cheburgram-client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cheburgram-protocol = { path = "../protocol" }
+tokio = { workspace = true, features = ["full"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+cpal.workspace = true
+opus.workspace = true
+ringbuf.workspace = true
+eframe.workspace = true
+egui.workspace = true
+serde_json.workspace = true

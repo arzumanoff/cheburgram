@@ -1,0 +1,21 @@
+# Rust target directory
+/target/
+**/*.rs.bk
+
+# Cargo lock file if not needed (for libraries, but for workspace/binaries we keep Cargo.lock)
+# Cargo.lock
+
+# Operating System files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE & Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment files
+.env
+*.env
