@@ -131,6 +131,7 @@ pub async fn handle_client(
     state: SharedState,
     registry: Arc<Mutex<ClientRegistry>>,
 ) -> Result<()> {
+    let _ = stream.set_nodelay(true);
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 

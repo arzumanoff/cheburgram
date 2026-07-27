@@ -287,6 +287,7 @@ impl App {
             if let Ok(mut stream) = w.lock() {
                 if let Ok(json) = serde_json::to_string(&msg) {
                     let _ = stream.write_all(format!("{}\n", json).as_bytes());
+                    let _ = stream.flush();
                 }
             }
         }
@@ -320,6 +321,7 @@ impl App {
                 return;
             }
         };
+        let _ = stream.set_nodelay(true);
 
         let writer = Arc::new(Mutex::new(stream.try_clone().unwrap()));
         self.tcp_writer = Some(writer.clone());
@@ -334,6 +336,7 @@ impl App {
             };
             if let Ok(json) = serde_json::to_string(&msg) {
                 let _ = w.write_all(format!("{}\n", json).as_bytes());
+                let _ = w.flush();
             }
         }
 
