@@ -505,11 +505,11 @@ fn run_audio_input_loop(
         }
 
         if !samples_to_encode.is_empty() {
-            let peak = samples_to_encode
-                .iter()
-                .map(|s| s.abs())
-                .fold(0.0f32, |a, b| a.max(b));
-            mic_level.store((peak * 100.0).min(100.0) as u8, Ordering::Relaxed);
+            let sum_sq: f32 = samples_to_encode.iter().map(|s| s * s).sum();
+            let rms = (sum_sq / samples_to_encode.len() as f32).sqrt();
+            // Скейлинг RMS для визуализации в процентах (0..100)
+            let scaled_pct = ((rms * 20.0).sqrt() * 100.0).min(100.0);
+            mic_level.store(scaled_pct as u8, Ordering::Relaxed);
 
             if let Ok(encoded_len) = encoder.encode_float(&samples_to_encode, &mut opus_output) {
                 let packet_payload = opus_output[..encoded_len].to_vec();
@@ -759,9 +759,21 @@ impl eframe::App for CheburgramApp {
 
                     ui.add_space(15.0);
 
-                    let mic_val = self.mic_level.load(Ordering::Relaxed) as f32 / 100.0;
-                    ui.label("Громкость микрофона:");
-                    ui.add(egui::ProgressBar::new(mic_val).text(format!("{:.0}%", mic_val * 100.0)));
+                    let mic_pct = self.mic_level.load(Ordering::Relaxed);
+                    let mic_val = mic_pct as f32 / 100.0;
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Громкость микрофона:").strong());
+                        ui.label(
+                            egui::RichText::new(format!("{}%", mic_pct))
+                                .strong()
+                                .color(if mic_pct > 0 { egui::Color32::GREEN } else { egui::Color32::GRAY }),
+                        );
+                    });
+                    ui.add(
+                        egui::ProgressBar::new(mic_val)
+                            .fill(egui::Color32::from_rgb(0, 180, 216))
+                            .show_percentage(),
+                    );
 
                     ui.add_space(20.0);
 
