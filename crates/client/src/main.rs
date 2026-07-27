@@ -56,30 +56,41 @@ struct SavedFriend {
 
 // ─── Конфигурация (%APPDATA%\Cheburgram\config.json) ──────────────────────────
 
+fn default_zoom() -> f32 { 1.0 }
+fn default_server_address() -> String { DEFAULT_SERVER.to_string() }
+fn default_user_code() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    format!("{:06}", rng.gen_range(100_000..999_999))
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct AppConfig {
+    #[serde(default)]
     client_id: String,
+    #[serde(default = "default_user_code")]
     user_code: String,
+    #[serde(default)]
     display_name: String,
+    #[serde(default = "default_server_address")]
     server_address: String,
+    #[serde(default)]
     selected_input: usize,
+    #[serde(default)]
     selected_output: usize,
     #[serde(default = "default_zoom")]
     zoom_factor: f32,
+    #[serde(default)]
     friends: Vec<SavedFriend>,
+    #[serde(default)]
     call_history: Vec<CallRecord>,
 }
 
-fn default_zoom() -> f32 { 1.0 }
-
 impl Default for AppConfig {
     fn default() -> Self {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let code = format!("{:06}", rng.gen_range(100_000..999_999));
         Self {
             client_id: Uuid::new_v4().to_string(),
-            user_code: code,
+            user_code: default_user_code(),
             display_name: String::new(),
             server_address: DEFAULT_SERVER.to_string(),
             selected_input: 0,
@@ -108,12 +119,24 @@ fn load_config() -> AppConfig {
     let p = config_path();
     if p.exists() {
         if let Ok(d) = fs::read_to_string(&p) {
-            if let Ok(c) = serde_json::from_str::<AppConfig>(&d) {
+            if let Ok(mut c) = serde_json::from_str::<AppConfig>(&d) {
+                if c.client_id.is_empty() {
+                    c.client_id = Uuid::new_v4().to_string();
+                }
+                if c.user_code.len() != 6 || !c.user_code.chars().all(|ch| ch.is_ascii_digit()) {
+                    c.user_code = default_user_code();
+                }
+                if c.server_address.is_empty() {
+                    c.server_address = DEFAULT_SERVER.to_string();
+                }
+                save_config(&c);
                 return c;
             }
         }
     }
-    AppConfig::default()
+    let c = AppConfig::default();
+    save_config(&c);
+    c
 }
 
 fn save_config(c: &AppConfig) {
