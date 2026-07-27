@@ -2,8 +2,15 @@
 /target/
 **/*.rs.bk
 
-# Cargo lock file if not needed (for libraries, but for workspace/binaries we keep Cargo.lock)
-# Cargo.lock
+# Cargo.lock не коммитим — генерируется при сборке (локально и в Docker)
+/Cargo.lock
+
+# Данные сервера (реестр пользователей) — НЕ коммитить!
+clients.json
+clients.json.tmp
+*.db
+*.db-wal
+*.db-shm
 
 # Operating System files
 .DS_Store

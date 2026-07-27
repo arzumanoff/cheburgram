@@ -5,22 +5,22 @@ edition.workspace = true
 
 [dependencies]
 cheburgram-protocol = { path = "../protocol" }
+cheburgram-audio = { path = "../audio" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 cpal.workspace = true
-opus.workspace = true
-ringbuf.workspace = true
 eframe.workspace = true
 egui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 chrono.workspace = true
-tray-icon.workspace = true
-winreg.workspace = true
 rand.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+tray-icon.workspace = true
+winreg.workspace = true
 
 [build-dependencies]
 winres = "0.1"

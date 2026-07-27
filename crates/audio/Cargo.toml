@@ -1,0 +1,14 @@
+[package]
+name = "cheburgram-audio"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cheburgram-protocol = { path = "../protocol" }
+cpal.workspace = true
+audiopus.workspace = true
+audiopus_sys.workspace = true
+rubato.workspace = true
+ringbuf.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

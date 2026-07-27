@@ -6,7 +6,7 @@ fn main() {
         res.set("FileDescription", "Cheburgram Voice Messenger");
         res.set("ProductName", "Cheburgram");
         res.set("LegalCopyright", "Cheburgram Team");
-        res.set_version_info(winres::VersionInfo::PRODUCTVERSION, 0x0002000000000000);
+        res.set_version_info(winres::VersionInfo::PRODUCTVERSION, 0x0003000000000000);
         let _ = res.compile();
     }
 }
