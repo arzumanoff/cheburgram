@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use cheburgram_protocol::{AudioPacket, ControlMessage};
-use rand::Rng;
+use cheburgram_protocol::{AudioPacket, ControlMessage, UserInfo};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -15,47 +15,111 @@ use tracing::{error, info, warn};
 
 const TCP_SIGNAL_PORT: u16 = 7878;
 const UDP_MEDIA_PORT: u16 = 7879;
+const CLIENTS_FILE: &str = "clients.json";
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct Participant {
-    peer_id: u32,
-    tx: mpsc::UnboundedSender<ControlMessage>,
-    udp_addr: Option<SocketAddr>,
+// ─── Постоянный реестр клиентов (хранится на диске) ───────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ClientRegistry {
+    /// UUID клиента → запись
+    clients: HashMap<String, RegistryEntry>,
 }
 
-#[derive(Debug, Default)]
-#[allow(dead_code)]
-struct Room {
-    code: String,
-    participants: HashMap<u32, Participant>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RegistryEntry {
+    name: String,
+    last_seen: String,
+}
+
+impl ClientRegistry {
+    fn load() -> Self {
+        if let Ok(data) = std::fs::read_to_string(CLIENTS_FILE) {
+            if let Ok(reg) = serde_json::from_str(&data) {
+                return reg;
+            }
+        }
+        Self::default()
+    }
+
+    fn save(&self) {
+        if let Ok(data) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(CLIENTS_FILE, data);
+        }
+    }
+
+    fn upsert(&mut self, client_id: &str, name: &str) {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.clients.insert(
+            client_id.to_string(),
+            RegistryEntry { name: name.to_string(), last_seen: now },
+        );
+        self.save();
+    }
+}
+
+// ─── Онлайн-состояние (в памяти) ─────────────────────────────────────────────
+
+#[derive(Debug)]
+struct OnlineUser {
+    peer_id: u32,
+    client_id: String,
+    name: String,
+    tx: mpsc::UnboundedSender<ControlMessage>,
+    udp_addr: Option<SocketAddr>,
+    /// С кем сейчас в звонке (peer_id)
+    in_call_with: Option<u32>,
 }
 
 #[derive(Debug, Default)]
 struct State {
-    rooms: HashMap<String, Room>,
-    /// Маппинг UDP SocketAddr на (room_code, peer_id)
-    udp_peers: HashMap<SocketAddr, (String, u32)>,
+    /// peer_id → OnlineUser
+    online: HashMap<u32, OnlineUser>,
     next_peer_id: u32,
+    /// Текущий ID сессии звонка (для UDP реле)
+    next_call_id: u64,
+    /// call_session_id → (peer_id_a, peer_id_b)
+    active_calls: HashMap<u64, (u32, u32)>,
+}
+
+impl State {
+    fn user_list(&self) -> Vec<UserInfo> {
+        self.online
+            .values()
+            .map(|u| UserInfo { peer_id: u.peer_id, name: u.name.clone() })
+            .collect()
+    }
+
+    fn broadcast_except(&self, except_peer: u32, msg: ControlMessage) {
+        for (&pid, user) in &self.online {
+            if pid != except_peer {
+                let _ = user.tx.send(msg.clone());
+            }
+        }
+    }
 }
 
 type SharedState = Arc<Mutex<State>>;
+
+// ─── Main ────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    info!("🚀 Запуск сервера Cheburgram...");
-    info!("   Сигналы (TCP): 0.0.0.0:{}", TCP_SIGNAL_PORT);
-    info!("   Медиа (UDP):   0.0.0.0:{}", UDP_MEDIA_PORT);
+    info!("🚀 Запуск Cheburgram Server v2...");
+    info!("   TCP сигналы: 0.0.0.0:{}", TCP_SIGNAL_PORT);
+    info!("   UDP медиа:   0.0.0.0:{}", UDP_MEDIA_PORT);
+
+    let registry = Arc::new(Mutex::new(ClientRegistry::load()));
+    info!("📋 Загружен реестр: {} клиентов", registry.lock().await.clients.len());
 
     let state: SharedState = Arc::new(Mutex::new(State::default()));
 
-    // Запуск UDP Медиа-реле
+    // ── UDP Медиа-реле ────────────────────────────────────────────────────────
     let udp_socket = Arc::new(
         UdpSocket::bind(format!("0.0.0.0:{}", UDP_MEDIA_PORT))
             .await
-            .context("Не удалось привязать UDP сокет")?,
+            .context("Не удалось привязать UDP")?,
     );
 
     let state_udp = state.clone();
@@ -69,91 +133,74 @@ async fn main() -> Result<()> {
                     if let Ok(packet) = AudioPacket::from_bytes(data) {
                         let mut st = state_udp.lock().await;
 
-                        let is_new = !st.udp_peers.contains_key(&src_addr);
-                        // Регистрируем/обновляем UDP адрес отправителя
-                        st.udp_peers.insert(src_addr, (packet.header.room_code.clone(), packet.header.sender_id));
-
-                        if let Some(room) = st.rooms.get_mut(&packet.header.room_code) {
-                            if let Some(p) = room.participants.get_mut(&packet.header.sender_id) {
-                                if is_new || p.udp_addr.is_none() {
-                                    info!("📍 UDP зарегистрирован: peer={} addr={} room={}", 
-                                          packet.header.sender_id, src_addr, packet.header.room_code);
-                                }
-                                p.udp_addr = Some(src_addr);
-                            } else {
-                                info!("⚠️ UDP пакет от неизвестного peer={} в комнате {}", 
-                                      packet.header.sender_id, packet.header.room_code);
+                        // Регистрируем UDP адрес
+                        if let Some(user) = st.online.values_mut()
+                            .find(|u| u.peer_id == packet.header.sender_id)
+                        {
+                            if user.udp_addr != Some(src_addr) {
+                                info!("📍 UDP addr: peer={} → {}", packet.header.sender_id, src_addr);
+                                user.udp_addr = Some(src_addr);
                             }
-
-                            // Пустые пакеты — только регистрация UDP адреса, не пересылаем
-                            if packet.payload.is_empty() {
-                                let known_peers: Vec<String> = room.participants.iter()
-                                    .map(|(id, p)| format!("peer{}={:?}", id, p.udp_addr))
-                                    .collect();
-                                info!("🔔 UDP ping от peer={} | Комната: {}", 
-                                      packet.header.sender_id, known_peers.join(", "));
-                                continue;
-                            }
-
-                            // Пересылаем пакет ВСЕМ ДРУГИМ участникам комнаты
-                            let mut forwarded = 0u32;
-                            for (&peer_id, participant) in &room.participants {
-                                if peer_id != packet.header.sender_id {
-                                    if let Some(target_addr) = participant.udp_addr {
-                                        let udp_send = udp_recv.clone();
-                                        let packet_bytes = data.to_vec();
-                                        tokio::spawn(async move {
-                                            let _ = udp_send.send_to(&packet_bytes, target_addr).await;
-                                        });
-                                        forwarded += 1;
-                                    } else {
-                                        info!("⚠️ Нет UDP адреса для peer={}, пропускаем", peer_id);
-                                    }
-                                }
-                            }
-                            if forwarded == 0 {
-                                info!("⚠️ Пакет от peer={} некуда переслать (собеседник не зарегистрировал UDP)", 
-                                      packet.header.sender_id);
-                            }
-                        } else {
-                            info!("⚠️ UDP пакет для несуществующей комнаты: {}", packet.header.room_code);
                         }
-                    } else {
-                        info!("⚠️ Не удалось десериализовать UDP пакет от {}, размер={}", src_addr, len);
+
+                        // Пустой payload = только регистрация, не пересылаем
+                        if packet.payload.is_empty() {
+                            continue;
+                        }
+
+                        // Найти звонок и переслать партнёру
+                        let sender_id = packet.header.sender_id;
+                        let call_id = packet.header.room_id;
+                        if let Some(&(a, b)) = st.active_calls.get(&call_id) {
+                            let target_id = if a == sender_id { b } else { a };
+                            if let Some(target) = st.online.get(&target_id) {
+                                if let Some(target_addr) = target.udp_addr {
+                                    let udp_send = udp_recv.clone();
+                                    let pkt = data.to_vec();
+                                    tokio::spawn(async move {
+                                        let _ = udp_send.send_to(&pkt, target_addr).await;
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
-                Err(e) => {
-                    error!("Ошибка чтения UDP сокета: {}", e);
-                }
+                Err(e) => error!("UDP ошибка: {}", e),
             }
         }
     });
 
-    // Запуск TCP Сигнального сервера
+    // ── TCP Сигнальный сервер ────────────────────────────────────────────────
     let tcp_listener = TcpListener::bind(format!("0.0.0.0:{}", TCP_SIGNAL_PORT))
         .await
-        .context("Не удалось привязать TCP сокет")?;
+        .context("Не удалось привязать TCP")?;
 
     loop {
         let (stream, peer_addr) = tcp_listener.accept().await?;
-        info!("Новое TCP подключение сигналов: {}", peer_addr);
-
-        let state_clone = state.clone();
+        info!("🔌 TCP подключение: {}", peer_addr);
+        let state_c = state.clone();
+        let registry_c = registry.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_client(stream, state_clone).await {
-                warn!("Ошибка обработки клиента {}: {:?}", peer_addr, e);
+            if let Err(e) = handle_client(stream, state_c, registry_c).await {
+                warn!("Клиент {} отключился: {:?}", peer_addr, e);
             }
         });
     }
 }
 
-async fn handle_client(stream: TcpStream, state: SharedState) -> Result<()> {
+// ─── Обработка клиента ────────────────────────────────────────────────────────
+
+async fn handle_client(
+    stream: TcpStream,
+    state: SharedState,
+    registry: Arc<Mutex<ClientRegistry>>,
+) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
     let (tx, mut rx) = mpsc::unbounded_channel::<ControlMessage>();
 
-    // Таск на отправку сообщений клиенту
+    // Задача отправки
     let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if let Ok(json) = serde_json::to_string(&msg) {
@@ -164,7 +211,6 @@ async fn handle_client(stream: TcpStream, state: SharedState) -> Result<()> {
         }
     });
 
-    let mut current_room: Option<String> = None;
     let mut my_peer_id: Option<u32> = None;
 
     while let Ok(Some(line)) = lines.next_line().await {
@@ -174,128 +220,205 @@ async fn handle_client(stream: TcpStream, state: SharedState) -> Result<()> {
         };
 
         match msg {
-            ControlMessage::CreateRoom => {
+            ControlMessage::Register { client_id, name } => {
                 let mut st = state.lock().await;
                 let peer_id = st.next_peer_id;
                 st.next_peer_id += 1;
 
-                let room_code = generate_room_code(&st.rooms);
-                info!("Создана новая комната: {} (Peer ID: {})", room_code, peer_id);
+                info!("✅ Зарегистрирован: '{}' (peer={}, uuid={}...)", name, peer_id, &client_id[..8]);
 
-                let participant = Participant {
+                // Обновляем реестр на диске
+                {
+                    let mut reg = registry.lock().await;
+                    reg.upsert(&client_id, &name);
+                }
+
+                let user_list = st.user_list();
+
+                let user = OnlineUser {
                     peer_id,
+                    client_id,
+                    name: name.clone(),
                     tx: tx.clone(),
                     udp_addr: None,
+                    in_call_with: None,
                 };
-
-                let mut room = Room {
-                    code: room_code.clone(),
-                    participants: HashMap::new(),
-                };
-                room.participants.insert(peer_id, participant);
-                st.rooms.insert(room_code.clone(), room);
-
-                current_room = Some(room_code.clone());
+                st.online.insert(peer_id, user);
                 my_peer_id = Some(peer_id);
 
-                let _ = tx.send(ControlMessage::RoomCreated {
-                    room_code,
+                // Отправляем новому: подтверждение + список онлайн
+                let _ = tx.send(ControlMessage::Registered {
                     peer_id,
                     udp_port: UDP_MEDIA_PORT,
                 });
+                let _ = tx.send(ControlMessage::UserList { users: user_list });
+
+                // Всем остальным: новый юзер онлайн
+                st.broadcast_except(peer_id, ControlMessage::UserOnline {
+                    peer_id,
+                    name,
+                });
             }
-            ControlMessage::JoinRoom { room_code } => {
-                let mut st = state.lock().await;
-                let room_code = room_code.trim().to_uppercase();
 
-                if !st.rooms.contains_key(&room_code) {
-                    let _ = tx.send(ControlMessage::Error {
-                        message: "Комната с таким кодом не найдена".to_string(),
-                    });
-                    continue;
-                }
+            ControlMessage::CallRequest { to_id } => {
+                let st = state.lock().await;
+                let from_id = match my_peer_id {
+                    Some(id) => id,
+                    None => continue,
+                };
+                let from_name = st.online.get(&from_id)
+                    .map(|u| u.name.clone())
+                    .unwrap_or_default();
 
-                let peer_id = st.next_peer_id;
-                st.next_peer_id += 1;
-
-                if let Some(room) = st.rooms.get_mut(&room_code) {
-                    if room.participants.len() >= 2 {
+                if let Some(target) = st.online.get(&to_id) {
+                    if target.in_call_with.is_some() {
                         let _ = tx.send(ControlMessage::Error {
-                            message: "Комната заполнена (максимум 2 участника)".to_string(),
+                            message: format!("{} сейчас занят", target.name),
                         });
-                        continue;
+                    } else {
+                        info!("📞 Звонок: peer={} → peer={}", from_id, to_id);
+                        let _ = target.tx.send(ControlMessage::IncomingCall {
+                            from_id,
+                            from_name,
+                        });
                     }
-
-                    info!("Участник {} подключился к комнате {}", peer_id, room_code);
-
-                    // Оповещаем существующего участника
-                    for existing_p in room.participants.values() {
-                        let _ = existing_p.tx.send(ControlMessage::PeerConnected { peer_id });
-                    }
-
-                    let participant = Participant {
-                        peer_id,
-                        tx: tx.clone(),
-                        udp_addr: None,
-                    };
-                    room.participants.insert(peer_id, participant);
-
-                    current_room = Some(room_code.clone());
-                    my_peer_id = Some(peer_id);
-
-                    // Сообщаем новому участнику о входе
-                    let _ = tx.send(ControlMessage::RoomJoined {
-                        room_code,
-                        peer_id,
-                        udp_port: UDP_MEDIA_PORT,
+                } else {
+                    let _ = tx.send(ControlMessage::Error {
+                        message: "Пользователь недоступен".to_string(),
                     });
-
-                    // Если в комнате теперь 2 человека, оповещаем нового о присутствии первого
-                    if room.participants.len() == 2 {
-                        for (&existing_id, _) in &room.participants {
-                            if existing_id != peer_id {
-                                let _ = tx.send(ControlMessage::PeerConnected { peer_id: existing_id });
-                            }
-                        }
-                    }
                 }
             }
+
+            ControlMessage::CallAccept { to_id } => {
+                let mut st = state.lock().await;
+                let from_id = match my_peer_id {
+                    Some(id) => id,
+                    None => continue,
+                };
+
+                let call_id = st.next_call_id;
+                st.next_call_id += 1;
+                st.active_calls.insert(call_id, (from_id, to_id));
+
+                let (from_name, to_name) = {
+                    let fn_ = st.online.get(&from_id).map(|u| u.name.clone()).unwrap_or_default();
+                    let tn = st.online.get(&to_id).map(|u| u.name.clone()).unwrap_or_default();
+                    (fn_, tn)
+                };
+
+                // Помечаем обоих как "в звонке"
+                if let Some(u) = st.online.get_mut(&from_id) {
+                    u.in_call_with = Some(to_id);
+                }
+                if let Some(u) = st.online.get_mut(&to_id) {
+                    u.in_call_with = Some(from_id);
+                }
+
+                info!("✅ Звонок начат: peer={} ↔ peer={} (call_id={})", from_id, to_id, call_id);
+
+                // Уведомляем инициатора
+                if let Some(initiator) = st.online.get(&to_id) {
+                    let _ = initiator.tx.send(ControlMessage::CallAccepted {
+                        peer_id: from_id,
+                        peer_name: from_name,
+                    });
+                }
+                // Принявшему — тоже CallAccepted
+                let _ = tx.send(ControlMessage::CallAccepted {
+                    peer_id: to_id,
+                    peer_name: to_name,
+                });
+            }
+
+            ControlMessage::CallReject { to_id } => {
+                let st = state.lock().await;
+                let from_id = match my_peer_id {
+                    Some(id) => id,
+                    None => continue,
+                };
+                let from_name = st.online.get(&from_id)
+                    .map(|u| u.name.clone())
+                    .unwrap_or_default();
+
+                if let Some(target) = st.online.get(&to_id) {
+                    let _ = target.tx.send(ControlMessage::CallRejected {
+                        peer_id: from_id,
+                        peer_name: from_name,
+                    });
+                }
+                info!("❌ Звонок отклонён: peer={} → peer={}", from_id, to_id);
+            }
+
+            ControlMessage::CallEnd => {
+                let mut st = state.lock().await;
+                let my_id = match my_peer_id {
+                    Some(id) => id,
+                    None => continue,
+                };
+
+                let partner_id = st.online.get(&my_id)
+                    .and_then(|u| u.in_call_with);
+                let my_name = st.online.get(&my_id)
+                    .map(|u| u.name.clone())
+                    .unwrap_or_default();
+
+                // Убираем пометку "в звонке"
+                if let Some(u) = st.online.get_mut(&my_id) {
+                    u.in_call_with = None;
+                }
+
+                // Удаляем активный звонок
+                st.active_calls.retain(|_, &mut (a, b)| a != my_id && b != my_id);
+
+                if let Some(pid) = partner_id {
+                    if let Some(u) = st.online.get_mut(&pid) {
+                        u.in_call_with = None;
+                    }
+                    if let Some(partner) = st.online.get(&pid) {
+                        let _ = partner.tx.send(ControlMessage::CallEnded {
+                            peer_name: my_name,
+                        });
+                    }
+                    info!("📴 Звонок завершён: peer={} ↔ peer={}", my_id, pid);
+                }
+            }
+
             ControlMessage::Ping => {
                 let _ = tx.send(ControlMessage::Pong);
             }
+
             _ => {}
         }
     }
 
-    // Очистка при отключении
-    if let (Some(room_code), Some(peer_id)) = (current_room, my_peer_id) {
+    // Отключение
+    if let Some(my_id) = my_peer_id {
         let mut st = state.lock().await;
-        if let Some(room) = st.rooms.get_mut(&room_code) {
-            room.participants.remove(&peer_id);
-            info!("Участник {} вышел из комнаты {}", peer_id, room_code);
 
-            // Оповещаем оставшегося
-            for p in room.participants.values() {
-                let _ = p.tx.send(ControlMessage::PeerDisconnected { peer_id });
-            }
+        let partner_id = st.online.get(&my_id).and_then(|u| u.in_call_with);
+        let my_name = st.online.get(&my_id).map(|u| u.name.clone()).unwrap_or_default();
 
-            if room.participants.is_empty() {
-                st.rooms.remove(&room_code);
-                info!("Комната {} удалена (пустая)", room_code);
+        // Завершить звонок если был
+        if let Some(pid) = partner_id {
+            if let Some(u) = st.online.get_mut(&pid) {
+                u.in_call_with = None;
             }
+            if let Some(partner) = st.online.get(&pid) {
+                let _ = partner.tx.send(ControlMessage::CallEnded {
+                    peer_name: my_name.clone(),
+                });
+            }
+            st.active_calls.retain(|_, &mut (a, b)| a != my_id && b != my_id);
         }
+
+        st.online.remove(&my_id);
+        info!("👋 Офлайн: '{}' (peer={})", my_name, my_id);
+        st.broadcast_except(my_id, ControlMessage::UserOffline {
+            peer_id: my_id,
+            name: my_name,
+        });
     }
 
     send_task.abort();
     Ok(())
-}
-
-fn generate_room_code(existing_rooms: &HashMap<String, Room>) -> String {
-    let mut rng = rand::thread_rng();
-    loop {
-        let code: String = (0..6).map(|_| rng.gen_range(0..=9).to_string()).collect();
-        if !existing_rooms.contains_key(&code) {
-            return code;
-        }
-    }
 }

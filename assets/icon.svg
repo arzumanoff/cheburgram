@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" shape-rendering="geometricPrecision" text-rendering="geometricPrecision">
+    <defs>
+        <linearGradient id="a" x1="512" y1="0" x2="512" y2="1024" gradientUnits="userSpaceOnUse">
+            <stop offset="0" stop-color="#bce3ff"/>
+            <stop offset="1" stop-color="#80c6ff"/>
+        </linearGradient>
+    </defs>
+    <rect width="1024" height="1024" rx="220" ry="220" fill="url(#a)"/>
+    <ellipse cx="512" cy="512" rx="350" ry="350" fill="#fff" opacity=".4"/>
+    <g transform="translate(182 390)">
+        <ellipse cx="90" cy="150" rx="130" ry="150" fill="#a66e47"/>
+        <ellipse cx="570" cy="150" rx="130" ry="150" fill="#a66e47"/>
+        <ellipse cx="90" cy="150" rx="100" ry="120" fill="#be855c"/>
+        <ellipse cx="570" cy="150" rx="100" ry="120" fill="#be855c"/>
+        <path d="M70 70 A120 120 0 0 0 70 230" fill="none" stroke="#fff" stroke-width="25" stroke-linecap="round"/>
+        <path d="M110 90 A100 100 0 0 0 110 210" fill="none" stroke="#fff" stroke-width="25" stroke-linecap="round"/>
+        <path d="M590 70 A120 120 0 0 1 590 230" fill="none" stroke="#fff" stroke-width="25" stroke-linecap="round"/>
+        <path d="M550 90 A100 100 0 0 1 550 210" fill="none" stroke="#fff" stroke-width="25" stroke-linecap="round"/>
+        <ellipse cx="330" cy="150" rx="160" ry="150" fill="#a66e47"/>
+        <ellipse cx="330" cy="170" rx="130" ry="110" fill="#f5d6b8"/>
+        <circle cx="270" cy="140" r="25" fill="#3e2a1a"/>
+        <circle cx="270" cy="140" r="10" fill="#fff" opacity=".8"/>
+        <circle cx="390" cy="140" r="25" fill="#3e2a1a"/>
+        <circle cx="390" cy="140" r="10" fill="#fff" opacity=".8"/>
+        <path d="M245 95 A40 40 0 0 1 295 95" fill="none" stroke="#3e2a1a" stroke-width="10" stroke-linecap="round"/>
+        <path d="M365 95 A40 40 0 0 1 415 95" fill="none" stroke="#3e2a1a" stroke-width="10" stroke-linecap="round"/>
+        <ellipse cx="330" cy="190" rx="20" ry="15" fill="#3e2a1a"/>
+        <path d="M300 230 A60 40 0 0 0 360 230" fill="none" stroke="#3e2a1a" stroke-width="8" stroke-linecap="round"/>
+        <path d="M230 300 C230 450, 430 450, 430 300 Z" fill="#a66e47"/>
+        <path d="M260 300 C260 400, 400 400, 400 300 C330 330, 330 330, 260 300 Z" fill="#be855c" opacity=".6"/>
+    </g>
+    <g transform="translate(390 150)">
+        <path d="M0 70 C0 30, 30 0, 70 0 H180 C220 0, 250 30, 250 70 C250 110, 220 140, 180 140 H100 L40 180 V140 C15 140, 0 115, 0 70 Z" fill="#fff"/>
+        <circle cx="70" cy="70" r="15" fill="#ccc"/>
+        <circle cx="125" cy="70" r="15" fill="#ccc"/>
+        <circle cx="180" cy="70" r="15" fill="#ccc"/>
+    </g>
+</svg>

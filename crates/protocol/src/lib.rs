@@ -1,68 +1,120 @@
 use serde::{Deserialize, Serialize};
 
-/// Сообщения сигнализации (TCP контрольное соединение)
+/// Информация о пользователе
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserInfo {
+    pub peer_id: u32,
+    pub name: String,
+}
+
+/// Запись о звонке (для истории)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallRecord {
+    pub peer_name: String,
+    pub direction: CallDirection,
+    pub timestamp: String, // ISO 8601
+    pub duration_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CallDirection {
+    Incoming,
+    Outgoing,
+    Missed,
+}
+
+/// Все сигнальные сообщения (TCP)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlMessage {
-    /// Запрос на создание новой комнаты
-    CreateRoom,
-    /// Ответ сервера: комната создана
-    RoomCreated {
-        room_code: String,
+    // === Регистрация ===
+    /// Клиент регистрируется: client_id = UUID (постоянный), name = отображаемое имя
+    Register {
+        client_id: String,
+        name: String,
+    },
+    /// Сервер подтверждает регистрацию
+    Registered {
         peer_id: u32,
         udp_port: u16,
     },
-    /// Запрос на подключение к существующей комнате
-    JoinRoom {
-        room_code: String,
+
+    // === Присутствие (онлайн/офлайн) ===
+    /// Полный список пользователей (отправляется при входе)
+    UserList {
+        users: Vec<UserInfo>,
     },
-    /// Ответ сервера: успешный вход в комнату
-    RoomJoined {
-        room_code: String,
+    /// Новый пользователь появился онлайн
+    UserOnline {
         peer_id: u32,
-        udp_port: u16,
+        name: String,
     },
-    /// Уведомление: второй собеседник подключился к комнате
-    PeerConnected {
+    /// Пользователь ушёл офлайн
+    UserOffline {
         peer_id: u32,
+        name: String,
     },
-    /// Уведомление: второй собеседник отключился
-    PeerDisconnected {
+
+    // === Звонки ===
+    /// Исходящий запрос на звонок (клиент → сервер, сервер → цель)
+    CallRequest {
+        to_id: u32,
+    },
+    /// Сервер уведомляет цель о входящем звонке
+    IncomingCall {
+        from_id: u32,
+        from_name: String,
+    },
+    /// Цель принимает звонок
+    CallAccept {
+        to_id: u32,
+    },
+    /// Сервер уведомляет инициатора что звонок принят
+    CallAccepted {
         peer_id: u32,
+        peer_name: String,
     },
-    /// Пинг / Понг для проверки задержки
+    /// Звонок отклонён
+    CallReject {
+        to_id: u32,
+    },
+    /// Сервер уведомляет инициатора что звонок отклонён
+    CallRejected {
+        peer_id: u32,
+        peer_name: String,
+    },
+    /// Завершить активный звонок (любой участник)
+    CallEnd,
+    /// Уведомление что звонок завершён другой стороной
+    CallEnded {
+        peer_name: String,
+    },
+
+    // === Служебное ===
     Ping,
     Pong,
-    /// Сообщение об ошибке
     Error {
         message: String,
     },
 }
 
-/// Заголовок UDP пакета с голосом
+/// UDP аудио пакет
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioPacketHeader {
-    pub room_code: String,
+    pub room_id: u64,   // уникальный ID сессии звонка
     pub sender_id: u32,
     pub sequence: u64,
-    pub timestamp_ms: u64,
 }
 
-/// Полный зашифрованный/передаваемый пакет аудио
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioPacket {
     pub header: AudioPacketHeader,
-    pub payload: Vec<u8>, // Сжатый Opus фрейм
+    pub payload: Vec<u8>, // Opus-сжатый фрейм (пустой = ping-регистрация)
 }
 
 impl AudioPacket {
-    pub fn new(room_code: String, sender_id: u32, sequence: u64, timestamp_ms: u64, payload: Vec<u8>) -> Self {
+    pub fn new(room_id: u64, sender_id: u32, sequence: u64, payload: Vec<u8>) -> Self {
         Self {
-            header: AudioPacketHeader {
-                room_code,
-                sender_id,
-                sequence,
-                timestamp_ms,
-            },
+            header: AudioPacketHeader { room_id, sender_id, sequence },
             payload,
         }
     }

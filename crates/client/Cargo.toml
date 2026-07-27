@@ -5,7 +5,6 @@ edition.workspace = true
 
 [dependencies]
 cheburgram-protocol = { path = "../protocol" }
-tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
@@ -16,3 +15,8 @@ eframe.workspace = true
 egui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+[build-dependencies]
+winres = "0.1"

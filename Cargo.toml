@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["arzumanoff"]
 
@@ -24,3 +24,5 @@ opus = "0.3"
 ringbuf = "0.3"
 eframe = "0.27"
 egui = "0.27"
+uuid = { version = "1.10", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
