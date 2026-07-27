@@ -17,6 +17,7 @@ const TCP_SIGNAL_PORT: u16 = 7878;
 const UDP_MEDIA_PORT: u16 = 7879;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct Participant {
     peer_id: u32,
     tx: mpsc::UnboundedSender<ControlMessage>,
@@ -24,6 +25,7 @@ struct Participant {
 }
 
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 struct Room {
     code: String,
     participants: HashMap<u32, Participant>,
