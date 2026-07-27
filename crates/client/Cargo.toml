@@ -14,4 +14,5 @@ opus.workspace = true
 ringbuf.workspace = true
 eframe.workspace = true
 egui.workspace = true
+serde.workspace = true
 serde_json.workspace = true

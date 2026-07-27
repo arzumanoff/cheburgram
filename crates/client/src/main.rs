@@ -1,14 +1,20 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use anyhow::{anyhow, Result};
 use cheburgram_protocol::{AudioPacket, ControlMessage};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 use opus::{Application, Channels, Decoder, Encoder};
 use ringbuf::HeapRb;
+use serde::{Deserialize, Serialize};
 use std::{
-    io::Write,
+    fs,
+    io::{BufRead, BufReader, Write},
     net::{SocketAddr, TcpStream as StdTcpStream, UdpSocket as StdUdpSocket},
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
+        mpsc::{channel, Receiver, Sender},
         Arc, Mutex,
     },
     thread,
@@ -18,6 +24,51 @@ use tracing::{error, info};
 
 const SAMPLE_RATE: u32 = 48000;
 const FRAME_SIZE: usize = 960; // 20ms at 48kHz
+const DEFAULT_SERVER_IP: &str = "85.192.25.57:7878";
+const CONFIG_FILE_NAME: &str = "cheburgram_config.json";
+
+#[derive(Serialize, Deserialize, Clone)]
+struct AppConfig {
+    server_address: String,
+    selected_input: usize,
+    selected_output: usize,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            server_address: DEFAULT_SERVER_IP.to_string(),
+            selected_input: 0,
+            selected_output: 0,
+        }
+    }
+}
+
+fn get_config_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.join(CONFIG_FILE_NAME)))
+        .unwrap_or_else(|| PathBuf::from(CONFIG_FILE_NAME))
+}
+
+fn load_config() -> AppConfig {
+    let path = get_config_path();
+    if path.exists() {
+        if let Ok(data) = fs::read_to_string(&path) {
+            if let Ok(cfg) = serde_json::from_str::<AppConfig>(&data) {
+                return cfg;
+            }
+        }
+    }
+    AppConfig::default()
+}
+
+fn save_config(cfg: &AppConfig) {
+    let path = get_config_path();
+    if let Ok(data) = serde_json::to_string_pretty(cfg) {
+        let _ = fs::write(path, data);
+    }
+}
 
 #[derive(PartialEq, Clone, Copy)]
 enum AppState {
@@ -47,8 +98,9 @@ struct CheburgramApp {
     sound_muted: bool,
     mic_level: Arc<AtomicU8>, // 0..100 VU meter
 
-    // Сетевые потоки и управление
-    control_writer: Option<Arc<Mutex<StdTcpStream>>>,
+    // Сетевое управление
+    control_stream: Option<Arc<Mutex<StdTcpStream>>>,
+    event_rx: Option<Receiver<ControlMessage>>,
     udp_socket: Option<Arc<StdUdpSocket>>,
     stop_signal: Arc<AtomicBool>,
 
@@ -63,9 +115,11 @@ struct CheburgramApp {
 
 impl Default for CheburgramApp {
     fn default() -> Self {
+        let cfg = load_config();
         let (input_devices, output_devices) = get_audio_devices();
+
         Self {
-            server_address: "127.0.0.1:7878".to_string(),
+            server_address: cfg.server_address,
             room_code_input: String::new(),
             current_room: String::new(),
             peer_id: 0,
@@ -77,7 +131,8 @@ impl Default for CheburgramApp {
             sound_muted: false,
             mic_level: Arc::new(AtomicU8::new(0)),
 
-            control_writer: None,
+            control_stream: None,
+            event_rx: None,
             udp_socket: None,
             stop_signal: Arc::new(AtomicBool::new(false)),
 
@@ -88,8 +143,8 @@ impl Default for CheburgramApp {
             devices: AudioDevices {
                 input_devices,
                 output_devices,
-                selected_input: 0,
-                selected_output: 0,
+                selected_input: cfg.selected_input,
+                selected_output: cfg.selected_output,
             },
         }
     }
@@ -119,7 +174,36 @@ fn get_audio_devices() -> (Vec<String>, Vec<String>) {
     (inputs, outputs)
 }
 
+fn normalize_server_address(input: &str) -> String {
+    let s = input.trim();
+    if s.is_empty() {
+        return DEFAULT_SERVER_IP.to_string();
+    }
+
+    // Если указали порт :22 (SSH порт), меняем на 7878
+    if s.ends_with(":22") {
+        let host = s.trim_end_matches(":22");
+        return format!("{}:7878", host);
+    }
+
+    // Если порт не указан, добавляем :7878 по умолчанию
+    if !s.contains(':') {
+        return format!("{}:7878", s);
+    }
+
+    s.to_string()
+}
+
 impl CheburgramApp {
+    fn save_current_config(&self) {
+        let cfg = AppConfig {
+            server_address: self.server_address.clone(),
+            selected_input: self.devices.selected_input,
+            selected_output: self.devices.selected_output,
+        };
+        save_config(&cfg);
+    }
+
     fn create_room(&mut self) {
         self.connect_and_send(ControlMessage::CreateRoom);
     }
@@ -133,33 +217,68 @@ impl CheburgramApp {
         self.connect_and_send(ControlMessage::JoinRoom { room_code: code });
     }
 
-    fn connect_and_send(&mut self, msg: ControlMessage) {
+    fn connect_and_send(&mut self, request_msg: ControlMessage) {
+        let target_addr = normalize_server_address(&self.server_address);
+        self.server_address = target_addr.clone();
+        self.save_current_config();
+
         self.app_state = AppState::Connecting;
-        self.status_message = "Подключение к серверу...".to_string();
+        self.status_message = format!("Подключение к {}...", target_addr);
         self.stop_signal.store(false, Ordering::SeqCst);
 
-        let server_addr_str = self.server_address.clone();
-        let (tx, _rx) = std::sync::mpsc::channel::<Result<(StdTcpStream, ControlMessage), String>>();
+        let (event_tx, event_rx): (Sender<ControlMessage>, Receiver<ControlMessage>) = channel();
+        self.event_rx = Some(event_rx);
 
-        // Асинхронное подключение в отдельном потоке
+        let addr_clone = target_addr;
+        let stop_signal = self.stop_signal.clone();
+
         thread::spawn(move || {
-            match StdTcpStream::connect(&server_addr_str) {
+            match StdTcpStream::connect(&addr_clone) {
                 Ok(mut stream) => {
-                    let json = serde_json::to_string(&msg).unwrap();
+                    let json = serde_json::to_string(&request_msg).unwrap();
                     if let Err(e) = stream.write_all(format!("{}\n", json).as_bytes()) {
-                        let _ = tx.send(Err(format!("Ошибка отправки данных: {}", e)));
+                        let _ = event_tx.send(ControlMessage::Error {
+                            message: format!("Ошибка отправки запроса: {}", e),
+                        });
                         return;
                     }
-                    let _ = tx.send(Ok((stream, msg)));
+
+                    // Чтение ответов сервера
+                    let read_stream = match stream.try_clone() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let _ = event_tx.send(ControlMessage::Error {
+                                message: format!("Ошибка клонирования сокета: {}", e),
+                            });
+                            return;
+                        }
+                    };
+
+                    let mut reader = BufReader::new(read_stream);
+                    let mut line = String::new();
+
+                    while !stop_signal.load(Ordering::Relaxed) {
+                        line.clear();
+                        match reader.read_line(&mut line) {
+                            Ok(0) => break, // Соединение закрыто
+                            Ok(_) => {
+                                if let Ok(msg) = serde_json::from_str::<ControlMessage>(&line) {
+                                    if event_tx.send(msg).is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
                 }
                 Err(e) => {
-                    let _ = tx.send(Err(format!("Не удалось подключиться: {}", e)));
+                    let _ = event_tx.send(ControlMessage::Error {
+                        message: format!("Не удалось подключиться: {}", e),
+                    });
                 }
             }
         });
-
-        // Слушаем результат в главном цикле
-        // На время ожидания выставляем статус
     }
 
     fn leave_room(&mut self) {
@@ -169,7 +288,8 @@ impl CheburgramApp {
         self.current_room.clear();
         self.peer_connected = false;
         self.call_start_time = None;
-        self.control_writer = None;
+        self.control_stream = None;
+        self.event_rx = None;
         self.udp_socket = None;
     }
 
@@ -185,7 +305,6 @@ impl CheburgramApp {
         self.app_state = AppState::InRoom;
         self.call_start_time = Some(Instant::now());
 
-        // Создаем UDP сокет для отправителя и получателя
         let bind_addr = "0.0.0.0:0";
         let udp_socket = match StdUdpSocket::bind(bind_addr) {
             Ok(s) => Arc::new(s),
@@ -210,16 +329,16 @@ impl CheburgramApp {
         let packets_sent = self.packets_sent.clone();
         let packets_recv = self.packets_recv.clone();
 
-        // 1. Поток Захвата Микрофона -> Opus -> UDP
+        // 1. Захват микрофона
         let socket_send = udp_socket.clone();
-        let room_code_send = room_code.clone();
+        let room_code_send = room_code;
         thread::spawn(move || {
             if let Err(e) = run_audio_input_loop(
                 socket_send,
                 target_udp_addr,
                 room_code_send,
                 peer_id,
-                stop_signal.clone(),
+                stop_signal,
                 mic_level,
                 packets_sent,
             ) {
@@ -227,14 +346,69 @@ impl CheburgramApp {
             }
         });
 
-        // 2. Поток Приема UDP -> Opus -> Динамики
-        let socket_recv = udp_socket.clone();
+        // 2. Воспроизведение звука
+        let socket_recv = udp_socket;
         let stop_signal_recv = self.stop_signal.clone();
         thread::spawn(move || {
             if let Err(e) = run_audio_output_loop(socket_recv, stop_signal_recv, packets_recv) {
                 error!("Ошибка аудио вывода: {:?}", e);
             }
         });
+    }
+
+    fn poll_network_events(&mut self) {
+        let mut events = Vec::new();
+        if let Some(rx) = &self.event_rx {
+            while let Ok(msg) = rx.try_recv() {
+                events.push(msg);
+            }
+        }
+
+        for msg in events {
+            match msg {
+                ControlMessage::RoomCreated {
+                    room_code,
+                    peer_id,
+                    udp_port,
+                } => {
+                    let host = self
+                        .server_address
+                        .split(':')
+                        .next()
+                        .unwrap_or("85.192.25.57")
+                        .to_string();
+                    self.status_message = format!("Комната {} создана!", room_code);
+                    self.start_audio_and_media(room_code, peer_id, host, udp_port);
+                }
+                ControlMessage::RoomJoined {
+                    room_code,
+                    peer_id,
+                    udp_port,
+                } => {
+                    let host = self
+                        .server_address
+                        .split(':')
+                        .next()
+                        .unwrap_or("85.192.25.57")
+                        .to_string();
+                    self.status_message = format!("Вы вошли в комнату {}", room_code);
+                    self.start_audio_and_media(room_code, peer_id, host, udp_port);
+                }
+                ControlMessage::PeerConnected { peer_id: _ } => {
+                    self.peer_connected = true;
+                    self.status_message = "🟢 Собеседник подключился!".to_string();
+                }
+                ControlMessage::PeerDisconnected { peer_id: _ } => {
+                    self.peer_connected = false;
+                    self.status_message = "🟡 Собеседник отключился".to_string();
+                }
+                ControlMessage::Error { message } => {
+                    self.status_message = format!("Ошибка: {}", message);
+                    self.app_state = AppState::Disconnected;
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -250,7 +424,7 @@ fn run_audio_input_loop(
     let host = cpal::default_host();
     let device = host
         .default_input_device()
-        .ok_or_else(|| anyhow!("Не найдено микрофона"))?;
+        .ok_or_else(|| anyhow!("Микрофон не найден"))?;
 
     let config: cpal::StreamConfig = cpal::StreamConfig {
         channels: 1,
@@ -289,14 +463,12 @@ fn run_audio_input_loop(
         }
 
         if !samples_to_encode.is_empty() {
-            // Расчет VU meter
             let peak = samples_to_encode
                 .iter()
                 .map(|s| s.abs())
                 .fold(0.0f32, |a, b| a.max(b));
             mic_level.store((peak * 100.0).min(100.0) as u8, Ordering::Relaxed);
 
-            // Кодирование Opus
             if let Ok(encoded_len) = encoder.encode_float(&samples_to_encode, &mut opus_output) {
                 let packet_payload = opus_output[..encoded_len].to_vec();
                 let now_ms = Instant::now().elapsed().as_millis() as u64;
@@ -329,7 +501,7 @@ fn run_audio_output_loop(
     let host = cpal::default_host();
     let device = host
         .default_output_device()
-        .ok_or_else(|| anyhow!("Не найдено устройство воспроизведения"))?;
+        .ok_or_else(|| anyhow!("Устройство воспроизведения не найдено"))?;
 
     let config: cpal::StreamConfig = cpal::StreamConfig {
         channels: 1,
@@ -379,7 +551,8 @@ fn run_audio_output_loop(
 
 impl eframe::App for CheburgramApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Отрисовка стильной темной темы Cheburgram
+        self.poll_network_events();
+
         let mut visual = egui::Visuals::dark();
         visual.window_rounding = egui::Rounding::same(12.0);
         ctx.set_visuals(visual);
@@ -394,7 +567,7 @@ impl eframe::App for CheburgramApp {
                         .color(egui::Color32::from_rgb(255, 140, 0)),
                 );
                 ui.label(
-                    egui::RichText::new("Безопасный голосовой созвон 1-на-1")
+                    egui::RichText::new("Защищенный голосовой созвон 1-на-1")
                         .small()
                         .italics(),
                 );
@@ -412,7 +585,9 @@ impl eframe::App for CheburgramApp {
 
                         ui.horizontal(|ui| {
                             ui.label("VPS Сервер:");
-                            ui.text_edit_singleline(&mut self.server_address);
+                            if ui.text_edit_singleline(&mut self.server_address).changed() {
+                                self.save_current_config();
+                            }
                         });
                         ui.add_space(10.0);
 
@@ -454,6 +629,7 @@ impl eframe::App for CheburgramApp {
 
                         ui.horizontal(|ui| {
                             ui.label("Микрофон:  ");
+                            let prev_input = self.devices.selected_input;
                             egui::ComboBox::from_id_source("input_dev")
                                 .selected_text(&self.devices.input_devices[self.devices.selected_input])
                                 .show_ui(ui, |ui| {
@@ -461,10 +637,14 @@ impl eframe::App for CheburgramApp {
                                         ui.selectable_value(&mut self.devices.selected_input, i, dev);
                                     }
                                 });
+                            if prev_input != self.devices.selected_input {
+                                self.save_current_config();
+                            }
                         });
 
                         ui.horizontal(|ui| {
                             ui.label("Динамики:   ");
+                            let prev_output = self.devices.selected_output;
                             egui::ComboBox::from_id_source("output_dev")
                                 .selected_text(&self.devices.output_devices[self.devices.selected_output])
                                 .show_ui(ui, |ui| {
@@ -472,6 +652,9 @@ impl eframe::App for CheburgramApp {
                                         ui.selectable_value(&mut self.devices.selected_output, i, dev);
                                     }
                                 });
+                            if prev_output != self.devices.selected_output {
+                                self.save_current_config();
+                            }
                         });
                     });
                 }
@@ -481,6 +664,10 @@ impl eframe::App for CheburgramApp {
                         ui.spinner();
                         ui.add_space(10.0);
                         ui.label(&self.status_message);
+                        ui.add_space(15.0);
+                        if ui.button("Отмена").clicked() {
+                            self.leave_room();
+                        }
                     });
                 }
                 AppState::InRoom => {
@@ -495,7 +682,7 @@ impl eframe::App for CheburgramApp {
                                         .strong()
                                         .color(egui::Color32::LIGHT_BLUE),
                                 );
-                                if ui.button("📋").on_hover_text("Копировать").clicked() {
+                                if ui.button("📋").on_hover_text("Копировать код").clicked() {
                                     ui.output_mut(|o| o.copied_text = self.current_room.clone());
                                 }
                             });
@@ -525,7 +712,6 @@ impl eframe::App for CheburgramApp {
 
                     ui.add_space(15.0);
 
-                    // VU Meter уровня микрофона
                     let mic_val = self.mic_level.load(Ordering::Relaxed) as f32 / 100.0;
                     ui.label("Громкость микрофона:");
                     ui.add(egui::ProgressBar::new(mic_val).animate(true));
@@ -584,7 +770,6 @@ impl eframe::App for CheburgramApp {
             });
         });
 
-        // Регулярное обновление UI для анимации и VU-метра
         ctx.request_repaint_after(Duration::from_millis(50));
     }
 }
@@ -592,7 +777,7 @@ impl eframe::App for CheburgramApp {
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    info!("Запуск клиенской части Cheburgram...");
+    info!("Запуск клиента Cheburgram...");
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
