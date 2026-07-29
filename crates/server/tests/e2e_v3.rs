@@ -2,9 +2,10 @@
 //! Сценарий: регистрация → статусы → звонок → медиа-релей → завершение.
 
 use cheburgram_protocol::{
-    read_frame_sync, write_frame_sync, ControlMessage, MediaPacket, PROTOCOL_VERSION,
+    read_frame_sync, write_frame_sync, AuthError, AuthOutcome, ControlMessage, MediaPacket,
+    PROTOCOL_VERSION,
 };
-use cheburgram_server::{handle_client, route_media_packet, ClientRegistry, State, SharedState};
+use cheburgram_server::{handle_client, route_media_packet, ClientRegistry, SharedState, State};
 use std::io::BufReader;
 use std::net::{TcpStream, UdpSocket};
 use std::sync::Arc;
@@ -31,11 +32,12 @@ async fn start_server() -> TestServer {
         let registry = registry.clone();
         tokio::spawn(async move {
             loop {
-                let (stream, _) = tcp.accept().await.unwrap();
+                let (stream, peer_addr) = tcp.accept().await.unwrap();
                 let s = state.clone();
                 let r = registry.clone();
+                let ip = peer_addr.ip();
                 tokio::spawn(async move {
-                    let _ = handle_client(stream, s, r).await;
+                    let _ = handle_client(stream, ip, s, r).await;
                 });
             }
         });
@@ -78,10 +80,35 @@ impl TestClient {
         udp.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
         let mut c = TestClient { stream, reader, udp };
         c.send(&ControlMessage::Hello { protocol_version: PROTOCOL_VERSION });
+        let _nonce = match c.recv() {
+            ControlMessage::Challenge { nonce } => nonce,
+            m => panic!("Ожидался Challenge, получено: {:?}", m),
+        };
         c.send(&ControlMessage::Register {
             client_id: client_id.into(),
             user_code: String::new(),
             name: name.into(),
+        });
+        c
+    }
+
+    fn connect_auth(tcp_port: u16, user_code: &str, token: &str) -> Self {
+        let stream = TcpStream::connect(("127.0.0.1", tcp_port)).unwrap();
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let reader = BufReader::new(stream.try_clone().unwrap());
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        udp.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let mut c = TestClient { stream, reader, udp };
+        c.send(&ControlMessage::Hello { protocol_version: PROTOCOL_VERSION });
+        let nonce = match c.recv() {
+            ControlMessage::Challenge { nonce } => nonce,
+            m => panic!("Ожидался Challenge, получено: {:?}", m),
+        };
+        let token_hash = cheburgram_protocol::compute_token_hash(token);
+        let proof = cheburgram_protocol::compute_auth_proof(&token_hash, &nonce);
+        c.send(&ControlMessage::Auth {
+            user_code: user_code.into(),
+            proof,
         });
         c
     }
@@ -94,7 +121,6 @@ impl TestClient {
         read_frame_sync(&mut self.reader).unwrap()
     }
 
-    /// Ждёт конкретное сообщение, пропуская остальные
     fn wait_for(&mut self, pred: impl Fn(&ControlMessage) -> bool) -> ControlMessage {
         for _ in 0..50 {
             let msg = self.recv();
@@ -115,12 +141,12 @@ fn e2e_media_relay_full() {
     let mut a = TestClient::connect(server.tcp_port, "client-A2", "Алиса");
     let mut b = TestClient::connect(server.tcp_port, "client-B2", "Борис");
 
-    let (code_a, peer_a) = match a.wait_for(|m| matches!(m, ControlMessage::Registered { .. })) {
-        ControlMessage::Registered { user_code, peer_id, .. } => (user_code, peer_id),
+    let (code_a, peer_a) = match a.wait_for(|m| matches!(m, ControlMessage::AuthResponse { outcome: AuthOutcome::Ok { .. } })) {
+        ControlMessage::AuthResponse { outcome: AuthOutcome::Ok { user_code, peer_id, .. } } => (user_code, peer_id),
         _ => unreachable!(),
     };
-    let (code_b, peer_b) = match b.wait_for(|m| matches!(m, ControlMessage::Registered { .. })) {
-        ControlMessage::Registered { user_code, peer_id, .. } => (user_code, peer_id),
+    let (code_b, peer_b) = match b.wait_for(|m| matches!(m, ControlMessage::AuthResponse { outcome: AuthOutcome::Ok { .. } })) {
+        ControlMessage::AuthResponse { outcome: AuthOutcome::Ok { user_code, peer_id, .. } } => (user_code, peer_id),
         _ => unreachable!(),
     };
     assert_ne!(code_a, code_b);
@@ -181,22 +207,23 @@ fn e2e_media_relay_full() {
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     // ── медиапакет A → релей → B ──
+    let media_key = cheburgram_protocol::derive_media_key(call_id);
     let audio_frame = vec![0xAB; 120];
-    let pkt = MediaPacket::new(call_id, peer_a, 1, audio_frame.clone()).encode();
+    let pkt = MediaPacket::new(call_id, peer_a, 1, audio_frame.clone()).encode_encrypted(&media_key);
     a.udp.send_to(&pkt, ("127.0.0.1", server.udp_port)).unwrap();
 
     let mut buf = [0u8; 2048];
     let (n, _) = b.udp.recv_from(&mut buf).expect("B не получил медиапакет через релей");
-    let received = MediaPacket::decode(&buf[..n]).unwrap();
+    let received = MediaPacket::decode_encrypted(&buf[..n], &media_key).unwrap();
     assert_eq!(received.seq, 1);
     assert_eq!(received.sender_id, peer_a);
     assert_eq!(received.payload, audio_frame);
 
     // и в обратную сторону
-    let pkt_b = MediaPacket::new(call_id, peer_b, 1, vec![0xCD; 80]).encode();
+    let pkt_b = MediaPacket::new(call_id, peer_b, 1, vec![0xCD; 80]).encode_encrypted(&media_key);
     b.udp.send_to(&pkt_b, ("127.0.0.1", server.udp_port)).unwrap();
     let (n, _) = a.udp.recv_from(&mut buf).expect("A не получил ответный медиапакет");
-    let received = MediaPacket::decode(&buf[..n]).unwrap();
+    let received = MediaPacket::decode_encrypted(&buf[..n], &media_key).unwrap();
     assert_eq!(received.sender_id, peer_b);
 
     // ── завершение: B получает CallEnded, сеть A остаётся жива ──
@@ -219,22 +246,20 @@ fn e2e_session_replaced() {
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     let mut a1 = TestClient::connect(server.tcp_port, "client-same", "Алиса");
-    let code1 = match a1.wait_for(|m| matches!(m, ControlMessage::Registered { .. })) {
-        ControlMessage::Registered { user_code, .. } => user_code,
+    let code1 = match a1.wait_for(|m| matches!(m, ControlMessage::AuthResponse { outcome: AuthOutcome::Ok { .. } })) {
+        ControlMessage::AuthResponse { outcome: AuthOutcome::Ok { user_code, .. } } => user_code,
         _ => unreachable!(),
     };
 
-    // тот же client_id с нового подключения → старая сессия получает SessionReplaced
     let mut a2 = TestClient::connect(server.tcp_port, "client-same", "Алиса");
-    let code2 = match a2.wait_for(|m| matches!(m, ControlMessage::Registered { .. })) {
-        ControlMessage::Registered { user_code, .. } => user_code,
+    let code2 = match a2.wait_for(|m| matches!(m, ControlMessage::AuthResponse { outcome: AuthOutcome::Ok { .. } })) {
+        ControlMessage::AuthResponse { outcome: AuthOutcome::Ok { user_code, .. } } => user_code,
         _ => unreachable!(),
     };
     assert_eq!(code1, code2, "тот же аккаунт — тот же ID");
 
     a1.wait_for(|m| matches!(m, ControlMessage::SessionReplaced));
 
-    // новая сессия полноценно работает (регрессия «призраков» v2)
     a2.send(&ControlMessage::GetFriendsStatus { user_codes: vec![code1.clone()] });
     match a2.wait_for(|m| matches!(m, ControlMessage::FriendsStatus { .. })) {
         ControlMessage::FriendsStatus { friends } => {
@@ -253,10 +278,9 @@ fn e2e_call_accept_validation() {
 
     let mut a = TestClient::connect(server.tcp_port, "client-A3", "Алиса");
     let mut b = TestClient::connect(server.tcp_port, "client-B3", "Борис");
-    let _ = a.wait_for(|m| matches!(m, ControlMessage::Registered { .. }));
-    let _ = b.wait_for(|m| matches!(m, ControlMessage::Registered { .. }));
+    let _ = a.wait_for(|m| matches!(m, ControlMessage::AuthResponse { outcome: AuthOutcome::Ok { .. } }));
+    let _ = b.wait_for(|m| matches!(m, ControlMessage::AuthResponse { outcome: AuthOutcome::Ok { .. } }));
 
-    // B пытается «принять» звонок, которого не было (баг v2)
     b.send(&ControlMessage::CallAccept { target_peer_id: 1 });
     match b.wait_for(|m| matches!(m, ControlMessage::Error { .. })) {
         ControlMessage::Error { message } => {
@@ -265,7 +289,6 @@ fn e2e_call_accept_validation() {
         _ => unreachable!(),
     }
 
-    // A не должен получить CallAccepted
     a.stream
         .set_read_timeout(Some(std::time::Duration::from_millis(300)))
         .unwrap();
@@ -289,20 +312,18 @@ fn e2e_offline_message_delivery() {
     let server = rt.block_on(start_server());
     std::thread::sleep(std::time::Duration::from_millis(100));
 
-    // B регистрируется и отключается
     let code_b;
     {
         let mut b = TestClient::connect(server.tcp_port, "client-B4", "Борис");
-        code_b = match b.wait_for(|m| matches!(m, ControlMessage::Registered { .. })) {
-            ControlMessage::Registered { user_code, .. } => user_code,
+        code_b = match b.wait_for(|m| matches!(m, ControlMessage::AuthResponse { outcome: AuthOutcome::Ok { .. } })) {
+            ControlMessage::AuthResponse { outcome: AuthOutcome::Ok { user_code, .. } } => user_code,
             _ => unreachable!(),
         };
     }
     std::thread::sleep(std::time::Duration::from_millis(100));
 
-    // A шлёт сообщение оффлайн-B
     let mut a = TestClient::connect(server.tcp_port, "client-A4", "Алиса");
-    let _ = a.wait_for(|m| matches!(m, ControlMessage::Registered { .. }));
+    let _ = a.wait_for(|m| matches!(m, ControlMessage::AuthResponse { outcome: AuthOutcome::Ok { .. } }));
     a.send(&ControlMessage::SendTextMessage {
         target_code: code_b.clone(),
         text: "Пока ты спал".into(),
@@ -313,7 +334,6 @@ fn e2e_offline_message_delivery() {
         _ => unreachable!(),
     }
 
-    // B возвращается — получает отложенное сообщение
     let mut b2 = TestClient::connect(server.tcp_port, "client-B4", "Борис");
     match b2.wait_for(|m| matches!(m, ControlMessage::PendingTextMessages { .. })) {
         ControlMessage::PendingTextMessages { messages } => {
@@ -323,4 +343,67 @@ fn e2e_offline_message_delivery() {
         _ => unreachable!(),
     }
     drop(rt);
+}
+
+#[test]
+fn e2e_auth_token_flow() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(start_server());
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // 1. Регистрация первого клиента, получение auth_token
+    let mut client1 = TestClient::connect(server.tcp_port, "client-auth-1", "Иван");
+    let (code, token) = match client1.wait_for(|m| matches!(m, ControlMessage::AuthResponse { outcome: AuthOutcome::Ok { .. } })) {
+        ControlMessage::AuthResponse { outcome: AuthOutcome::Ok { user_code, auth_token, .. } } => (user_code, auth_token.unwrap()),
+        _ => unreachable!(),
+    };
+    assert!(!token.is_empty());
+    drop(client1);
+
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // 2. Вход с верным HMAC-доказательством
+    let mut client2 = TestClient::connect_auth(server.tcp_port, &code, &token);
+    match client2.wait_for(|m| matches!(m, ControlMessage::AuthResponse { .. })) {
+        ControlMessage::AuthResponse { outcome: AuthOutcome::Ok { .. } } => {}
+        _ => panic!("Авторизация должна пройти"),
+    }
+    drop(client2);
+
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // 3. Попытка входа с неверным токеном
+    let mut client3 = TestClient::connect_auth(server.tcp_port, &code, "wrong_token_123");
+    match client3.wait_for(|m| matches!(m, ControlMessage::AuthResponse { .. })) {
+        ControlMessage::AuthResponse { outcome: AuthOutcome::Failed(err) } => {
+            assert_eq!(err, AuthError::InvalidToken);
+        }
+        _ => panic!("Авторизация с неверным токеном должна отклоняться"),
+    }
+    drop(rt);
+}
+
+#[test]
+fn test_legacy_plaintext_notification() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listener = rt.block_on(async { TcpListener::bind("127.0.0.1:0").await.unwrap() });
+    let port = listener.local_addr().unwrap().port();
+
+    rt.spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let _ = cheburgram_server::handle_legacy_plaintext_client(stream).await;
+    });
+
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write_frame_sync(&mut stream, &ControlMessage::Hello { protocol_version: 2 }).unwrap();
+
+    let mut reader = BufReader::new(stream);
+    let reply = read_frame_sync(&mut reader).unwrap();
+
+    assert!(matches!(
+        reply,
+        ControlMessage::VersionMismatch { min: 3, max: 3 }
+    ));
 }

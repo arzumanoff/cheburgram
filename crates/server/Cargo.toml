@@ -13,3 +13,19 @@ rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+rustls-pemfile.workspace = true
+rcgen.workspace = true
+rusqlite.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+
+
+

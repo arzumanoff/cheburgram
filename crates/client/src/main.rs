@@ -185,12 +185,17 @@ fn main() -> Result<()> {
                             if quit_id.as_ref().map(|id| *id == ev.id).unwrap_or(false) {
                                 std::process::exit(0);
                             }
-                            if open_id.as_ref().map(|id| *id == ev.id).unwrap_or(true) {
+                            if open_id.as_ref().map(|id| *id == ev.id).unwrap_or(false) {
                                 wake = true;
                             }
                         }
-                        while let Ok(_ev) = tray_rx.try_recv() {
-                            wake = true;
+                        while let Ok(ev) = tray_rx.try_recv() {
+                            match ev {
+                                TrayIconEvent::Click { .. } => {
+                                    wake = true;
+                                }
+                                _ => {}
+                            }
                         }
                         if wake {
                             egui_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));

@@ -11,6 +11,8 @@ clients.json.tmp
 *.db
 *.db-wal
 *.db-shm
+*.exe
+
 
 # Operating System files
 .DS_Store

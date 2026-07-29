@@ -99,6 +99,7 @@ pub struct App {
     net: Option<NetHandle>,
     net_server: String,
     pub audio: Option<AudioHandle>,
+    pub ringtone: Option<cheburgram_audio::RingtoneHandle>,
 
     pub devs: AudioDevs,
     pub call_start: Option<Instant>,
@@ -146,6 +147,7 @@ impl App {
             net: None,
             net_server: String::new(),
             audio: None,
+            ringtone: None,
             devs,
             call_start: None,
             mic_test_level: Arc::new(AtomicU8::new(0)),
@@ -182,6 +184,9 @@ impl App {
             client_id: self.cfg.client_id.clone(),
             user_code: self.cfg.user_code.clone(),
             display_name: self.cfg.display_name.clone(),
+            auth_token: self.cfg.auth_token.clone(),
+            server_fingerprint: self.cfg.server_fingerprint.clone(),
+            tls_enabled: self.cfg.tls_enabled,
         };
         self.net = Some(net_start(creds));
     }
@@ -398,6 +403,7 @@ impl App {
 
     fn stop_audio(&mut self) {
         self.audio = None; // Drop AudioHandle остановит потоки
+        self.ringtone = None; // Drop RingtoneHandle остановит рингтон
     }
 
     fn start_audio(&mut self, call_id: u64) {
@@ -424,10 +430,19 @@ impl App {
             call_id,
             my_peer_id: self.my_peer_id.unwrap_or(0),
         };
-        self.audio = Some(start_call_audio(cfg));
+        let audio_handle = start_call_audio(cfg);
+        audio_handle.mic_gain.store(self.cfg.mic_gain.to_bits(), Ordering::Relaxed);
+        self.audio = Some(audio_handle);
     }
 
     // ── Управление звуком в звонке (через атомики AudioHandle) ──
+
+    pub fn set_mic_gain(&mut self, g: f32) {
+        self.cfg.mic_gain = g;
+        if let Some(a) = &self.audio {
+            a.mic_gain.store(g.to_bits(), Ordering::Relaxed);
+        }
+    }
 
     pub fn mic_muted(&self) -> bool {
         self.audio.as_ref().map(|a| a.mic_muted.load(Ordering::Relaxed)).unwrap_or(false)
@@ -541,17 +556,27 @@ impl App {
                     self.on_call_terminated(CallDirection::Missed);
                 }
                 NetEvent::Msg(msg) => self.handle_server_msg(msg),
+                NetEvent::TlsFingerprintDiscovered(fp) => {
+                    if self.cfg.server_fingerprint.as_ref() != Some(&fp) {
+                        tracing::info!("Pinning discovered TLS fingerprint: {}", fp);
+                        self.cfg.server_fingerprint = Some(fp);
+                        save_config(&self.cfg);
+                    }
+                }
             }
         }
     }
 
     fn handle_server_msg(&mut self, msg: ControlMessage) {
         match msg {
-            ControlMessage::Registered { peer_id, user_code, udp_port } => {
+            ControlMessage::Registered { peer_id, user_code, auth_token, udp_port } => {
                 self.my_peer_id = Some(peer_id);
                 self.udp_port = udp_port;
                 if self.cfg.user_code != user_code {
                     self.cfg.user_code = user_code.clone();
+                }
+                if let Some(token) = auth_token {
+                    self.cfg.auth_token = Some(token);
                 }
                 save_config(&self.cfg);
                 self.is_connected = true;
@@ -559,6 +584,47 @@ impl App {
                 self.status =
                     format!("В сети как {} (ID: {})", self.cfg.display_name, user_code);
                 self.request_friends_status();
+            }
+            ControlMessage::AuthResponse { outcome } => {
+                use cheburgram_protocol::{AuthError, AuthOutcome};
+                match outcome {
+                    AuthOutcome::Ok { peer_id, user_code, udp_port, auth_token } => {
+                        self.my_peer_id = Some(peer_id);
+                        self.udp_port = udp_port;
+                        if self.cfg.user_code != user_code {
+                            self.cfg.user_code = user_code.clone();
+                        }
+                        if let Some(token) = auth_token {
+                            self.cfg.auth_token = Some(token);
+                        }
+                        save_config(&self.cfg);
+                        self.is_connected = true;
+                        self.link_up = true;
+                        self.status =
+                            format!("В сети как {} (ID: {})", self.cfg.display_name, self.cfg.user_code);
+                        self.request_friends_status();
+                    }
+                    AuthOutcome::Failed(err) => {
+                        self.is_connected = false;
+                        match err {
+                            AuthError::InvalidToken | AuthError::UnknownAccount => {
+                                self.cfg.auth_token = None;
+                                save_config(&self.cfg);
+                                self.status =
+                                    "Аккаунт не найден или токен недействителен. Зарегистрируйтесь заново.".into();
+                            }
+                            AuthError::RateLimited { retry_after_secs } => {
+                                self.status = format!(
+                                    "Слишком много попыток входа. Попробуйте через {} с.",
+                                    retry_after_secs
+                                );
+                            }
+                            AuthError::ProtocolViolation => {
+                                self.status = "Ошибка протокола авторизации".into();
+                            }
+                        }
+                    }
+                }
             }
             ControlMessage::SessionReplaced => {
                 self.is_connected = false;
@@ -615,6 +681,10 @@ impl App {
                 if matches!(self.call_state, CallState::None) {
                     self.call_state =
                         CallState::IncomingCall { from_code, from_name, from_peer_id };
+                    self.ringtone = Some(cheburgram_audio::start_ringtone(
+                        Some("call.mp3"),
+                        self.devs.selected_output_name(),
+                    ));
                 }
             }
             ControlMessage::CallAccepted { peer_id, peer_name, call_id } => {

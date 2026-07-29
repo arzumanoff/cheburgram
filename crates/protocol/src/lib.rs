@@ -7,9 +7,9 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const MEDIA_MAGIC: u16 = 0x4347; // "CG"
-pub const MEDIA_VERSION: u8 = 2;
+pub const MEDIA_VERSION: u8 = 3;
 pub const MAX_FRAME_SIZE: u32 = 1 << 20; // 1 МБ — защита от мусора в потоке
 
 // ─── Данные ──────────────────────────────────────────────────────────────────
@@ -56,13 +56,63 @@ pub enum CallDirection {
     Missed,
 }
 
-// ─── Сигнальные сообщения (TCP) ─────────────────────────────────────────────
+use hmac::{Hmac, Mac};
+use sha2::{Digest, Sha256};
+
+pub type HmacSha256 = Hmac<Sha256>;
+
+pub fn compute_token_hash(token: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    hasher.finalize().into()
+}
+
+pub fn compute_auth_proof(token_hash: &[u8; 32], nonce: &[u8; 32]) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(token_hash).expect("HMAC supports 32-byte key");
+    mac.update(nonce);
+    mac.finalize().into_bytes().into()
+}
+
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut res = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        res |= x ^ y;
+    }
+    res == 0
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum AuthError {
+    InvalidToken,
+    UnknownAccount,
+    RateLimited { retry_after_secs: u32 },
+    ProtocolViolation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum AuthOutcome {
+    Ok {
+        peer_id: u32,
+        user_code: String,
+        udp_port: u16,
+        auth_token: Option<String>,
+    },
+    Failed(AuthError),
+}
+
+// ─── Сигнальные сообщения (TCP) ─────────────────────────────────────────────
+
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub enum ControlMessage {
     // === Рукопожатие и регистрация ===
     Hello {
         protocol_version: u16,
+    },
+    Challenge {
+        nonce: [u8; 32],
     },
     VersionMismatch {
         min: u16,
@@ -76,7 +126,15 @@ pub enum ControlMessage {
     Registered {
         peer_id: u32,
         user_code: String,
+        auth_token: Option<String>,
         udp_port: u16,
+    },
+    Auth {
+        user_code: String,
+        proof: [u8; 32],
+    },
+    AuthResponse {
+        outcome: AuthOutcome,
     },
     /// Сервер разрывает старую сессию этого же аккаунта
     SessionReplaced,
@@ -171,6 +229,57 @@ pub enum ControlMessage {
     Error {
         message: String,
     },
+}
+
+impl std::fmt::Debug for ControlMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ControlMessage::Hello { protocol_version } => f.debug_struct("Hello").field("protocol_version", protocol_version).finish(),
+            ControlMessage::Challenge { nonce: _ } => f.debug_struct("Challenge").field("nonce", &"<32 bytes>").finish(),
+            ControlMessage::VersionMismatch { min, max } => f.debug_struct("VersionMismatch").field("min", min).field("max", max).finish(),
+            ControlMessage::Register { client_id, user_code, name } => f.debug_struct("Register").field("client_id", client_id).field("user_code", user_code).field("name", name).finish(),
+            ControlMessage::Registered { peer_id, user_code, auth_token, udp_port } => {
+                let redacted = auth_token.as_ref().map(|_| "<redacted>");
+                f.debug_struct("Registered").field("peer_id", peer_id).field("user_code", user_code).field("auth_token", &redacted).field("udp_port", udp_port).finish()
+            }
+            ControlMessage::Auth { user_code, proof: _ } => f.debug_struct("Auth").field("user_code", user_code).field("proof", &"<redacted>").finish(),
+            ControlMessage::AuthResponse { outcome } => {
+                match outcome {
+                    AuthOutcome::Ok { peer_id, user_code, udp_port, auth_token } => {
+                        let redacted = auth_token.as_ref().map(|_| "<redacted>");
+                        f.debug_struct("AuthResponse::Ok").field("peer_id", peer_id).field("user_code", user_code).field("auth_token", &redacted).field("udp_port", udp_port).finish()
+                    }
+                    AuthOutcome::Failed(err) => f.debug_struct("AuthResponse::Failed").field("error", err).finish(),
+                }
+            }
+            ControlMessage::SessionReplaced => f.write_str("SessionReplaced"),
+            ControlMessage::SendFriendRequest { target_code } => f.debug_struct("SendFriendRequest").field("target_code", target_code).finish(),
+            ControlMessage::IncomingFriendRequest { from_code, from_name } => f.debug_struct("IncomingFriendRequest").field("from_code", from_code).field("from_name", from_name).finish(),
+            ControlMessage::AcceptFriendRequest { from_code } => f.debug_struct("AcceptFriendRequest").field("from_code", from_code).finish(),
+            ControlMessage::RejectFriendRequest { from_code } => f.debug_struct("RejectFriendRequest").field("from_code", from_code).finish(),
+            ControlMessage::FriendRequestAccepted { user_code, name } => f.debug_struct("FriendRequestAccepted").field("user_code", user_code).field("name", name).finish(),
+            ControlMessage::GetFriendsStatus { user_codes } => f.debug_struct("GetFriendsStatus").field("user_codes", user_codes).finish(),
+            ControlMessage::FriendsStatus { friends } => f.debug_struct("FriendsStatus").field("friends", friends).finish(),
+            ControlMessage::PendingFriendRequests { requests } => f.debug_struct("PendingFriendRequests").field("requests", requests).finish(),
+            ControlMessage::SendTextMessage { target_code, text, message_id } => f.debug_struct("SendTextMessage").field("target_code", target_code).field("text", text).field("message_id", message_id).finish(),
+            ControlMessage::IncomingTextMessage { msg } => f.debug_struct("IncomingTextMessage").field("msg", msg).finish(),
+            ControlMessage::TextMessageAck { message_id, delivered } => f.debug_struct("TextMessageAck").field("message_id", message_id).field("delivered", delivered).finish(),
+            ControlMessage::PendingTextMessages { messages } => f.debug_struct("PendingTextMessages").field("messages", messages).finish(),
+            ControlMessage::UserStatusChanged { user_code, is_online, peer_id } => f.debug_struct("UserStatusChanged").field("user_code", user_code).field("is_online", is_online).field("peer_id", peer_id).finish(),
+            ControlMessage::CallRequest { target_code } => f.debug_struct("CallRequest").field("target_code", target_code).finish(),
+            ControlMessage::IncomingCall { from_code, from_name, from_peer_id } => f.debug_struct("IncomingCall").field("from_code", from_code).field("from_name", from_name).field("from_peer_id", from_peer_id).finish(),
+            ControlMessage::CallAccept { target_peer_id } => f.debug_struct("CallAccept").field("target_peer_id", target_peer_id).finish(),
+            ControlMessage::CallAccepted { peer_id, peer_name, call_id } => f.debug_struct("CallAccepted").field("peer_id", peer_id).field("peer_name", peer_name).field("call_id", call_id).finish(),
+            ControlMessage::CallReject { target_peer_id } => f.debug_struct("CallReject").field("target_peer_id", target_peer_id).finish(),
+            ControlMessage::CallRejected { peer_id, peer_name } => f.debug_struct("CallRejected").field("peer_id", peer_id).field("peer_name", peer_name).finish(),
+            ControlMessage::CallEnd => f.write_str("CallEnd"),
+            ControlMessage::CallEnded { peer_name } => f.debug_struct("CallEnded").field("peer_name", peer_name).finish(),
+            ControlMessage::CallMissed { peer_name } => f.debug_struct("CallMissed").field("peer_name", peer_name).finish(),
+            ControlMessage::Ping => f.write_str("Ping"),
+            ControlMessage::Pong => f.write_str("Pong"),
+            ControlMessage::Error { message } => f.debug_struct("Error").field("message", message).finish(),
+        }
+    }
 }
 
 // ─── Бинарная сериализация TCP-кадров ───────────────────────────────────────
@@ -307,6 +416,26 @@ impl MediaPacket {
         out
     }
 
+    /// Зашифрованная сериализация (ChaCha20-Poly1305)
+    pub fn encode_encrypted(&self, key: &[u8; 32]) -> Vec<u8> {
+        let payload_enc = if self.is_keepalive || self.payload.is_empty() {
+            Vec::new()
+        } else {
+            encrypt_media_payload(key, self.call_id, self.seq, &self.payload)
+                .unwrap_or_else(|_| Vec::new())
+        };
+
+        let mut out = Vec::with_capacity(MEDIA_WIRE_HEADER_LEN + payload_enc.len());
+        out.extend_from_slice(&MEDIA_MAGIC.to_le_bytes());
+        out.push(MEDIA_VERSION);
+        out.push(if self.is_keepalive { FLAG_KEEPALIVE } else { 0 });
+        out.extend_from_slice(&self.call_id.to_le_bytes());
+        out.extend_from_slice(&self.sender_id.to_le_bytes());
+        out.extend_from_slice(&self.seq.to_le_bytes());
+        out.extend_from_slice(&payload_enc);
+        out
+    }
+
     /// Разбор пакета из буфера; None если пакет не наш/битый
     pub fn decode(bytes: &[u8]) -> Option<MediaPacket> {
         if bytes.len() < MEDIA_WIRE_HEADER_LEN {
@@ -328,6 +457,56 @@ impl MediaPacket {
             payload: bytes[MEDIA_WIRE_HEADER_LEN..].to_vec(),
         })
     }
+
+    /// Зашифрованный разбор и расшифровка пакета (ChaCha20-Poly1305)
+    pub fn decode_encrypted(bytes: &[u8], key: &[u8; 32]) -> Option<MediaPacket> {
+        let raw = Self::decode(bytes)?;
+        if raw.is_keepalive || raw.payload.is_empty() {
+            return Some(raw);
+        }
+        let decrypted_payload = decrypt_media_payload(key, raw.call_id, raw.seq, &raw.payload).ok()?;
+        Some(MediaPacket {
+            call_id: raw.call_id,
+            sender_id: raw.sender_id,
+            seq: raw.seq,
+            is_keepalive: raw.is_keepalive,
+            payload: decrypted_payload,
+        })
+    }
+}
+
+pub fn derive_media_key(call_id: u64) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"CHEBURGRAM_MEDIA_KEY_V3:");
+    hasher.update(&call_id.to_le_bytes());
+    let res = hasher.finalize();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&res);
+    key
+}
+
+pub fn derive_media_nonce(call_id: u64, seq: u32) -> [u8; 12] {
+    let mut nonce = [0u8; 12];
+    nonce[0..8].copy_from_slice(&call_id.to_le_bytes());
+    nonce[8..12].copy_from_slice(&seq.to_le_bytes());
+    nonce
+}
+
+pub fn encrypt_media_payload(key: &[u8; 32], call_id: u64, seq: u32, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    use chacha20poly1305::{aead::{Aead, KeyInit}, ChaCha20Poly1305, Key, Nonce};
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let nonce_bytes = derive_media_nonce(call_id, seq);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    cipher.encrypt(nonce, plaintext).map_err(|e| e.to_string())
+}
+
+pub fn decrypt_media_payload(key: &[u8; 32], call_id: u64, seq: u32, ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+    use chacha20poly1305::{aead::{Aead, KeyInit}, ChaCha20Poly1305, Key, Nonce};
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let nonce_bytes = derive_media_nonce(call_id, seq);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    cipher.decrypt(nonce, ciphertext).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -337,9 +516,13 @@ mod tests {
     #[test]
     fn test_control_message_bincode_roundtrip() {
         let messages = vec![
-            ControlMessage::Hello { protocol_version: 2 },
+            ControlMessage::Hello { protocol_version: 3 },
+            ControlMessage::Challenge { nonce: [0x42; 32] },
             ControlMessage::Register { client_id: "id1".into(), user_code: "123456".into(), name: "User".into() },
-            ControlMessage::Registered { peer_id: 1, user_code: "123456".into(), udp_port: 7879 },
+            ControlMessage::Registered { peer_id: 1, user_code: "123456".into(), auth_token: Some("secret_token".into()), udp_port: 7879 },
+            ControlMessage::Auth { user_code: "123456".into(), proof: [0xAA; 32] },
+            ControlMessage::AuthResponse { outcome: AuthOutcome::Ok { peer_id: 1, user_code: "123456".into(), udp_port: 7879, auth_token: None } },
+            ControlMessage::AuthResponse { outcome: AuthOutcome::Failed(AuthError::InvalidToken) },
             ControlMessage::SessionReplaced,
             ControlMessage::SendFriendRequest { target_code: "654321".into() },
             ControlMessage::IncomingFriendRequest { from_code: "654321".into(), from_name: "Friend".into() },
@@ -423,5 +606,36 @@ mod tests {
         // 20-байтовый заголовок против ~400 байт JSON у v1
         let pkt = MediaPacket::new(u64::MAX, u32::MAX, u32::MAX, vec![0u8; 100]);
         assert_eq!(pkt.encode().len(), 120);
+    }
+
+    #[test]
+    fn test_challenge_response_crypto() {
+        let token = "super_secret_token_12345";
+        let token_hash = compute_token_hash(token);
+        let nonce = [0x42u8; 32];
+
+        let proof1 = compute_auth_proof(&token_hash, &nonce);
+        let proof2 = compute_auth_proof(&token_hash, &nonce);
+        assert!(constant_time_eq(&proof1, &proof2));
+
+        let wrong_token_hash = compute_token_hash("wrong_token");
+        let wrong_proof = compute_auth_proof(&wrong_token_hash, &nonce);
+        assert!(!constant_time_eq(&proof1, &wrong_proof));
+    }
+
+    #[test]
+    fn test_media_packet_encryption() {
+        let key = derive_media_key(99999);
+        let pkt = MediaPacket::new(99999, 42, 100, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        
+        let enc_bytes = pkt.encode_encrypted(&key);
+        // Header 20 bytes + payload 8 bytes + 16 bytes Poly1305 tag = 44 bytes
+        assert_eq!(enc_bytes.len(), MEDIA_WIRE_HEADER_LEN + 8 + 16);
+
+        let dec_pkt = MediaPacket::decode_encrypted(&enc_bytes, &key).unwrap();
+        assert_eq!(pkt, dec_pkt);
+
+        let wrong_key = derive_media_key(88888);
+        assert!(MediaPacket::decode_encrypted(&enc_bytes, &wrong_key).is_none());
     }
 }

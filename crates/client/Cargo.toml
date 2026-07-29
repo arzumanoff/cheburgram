@@ -17,6 +17,11 @@ serde_json.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 rand.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+
 
 [target.'cfg(windows)'.dependencies]
 tray-icon.workspace = true

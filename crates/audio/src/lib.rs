@@ -10,9 +10,11 @@ pub mod devices;
 pub mod engine;
 pub mod jitter;
 pub mod resample;
+pub mod ringtone;
 
 pub use engine::{start_call_audio, AudioHandle, AudioStats, CallAudioConfig};
 pub use jitter::{JitterBuffer, Pop};
+pub use ringtone::{start_ringtone, RingtoneHandle};
 
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const FRAME_SIZE: usize = 960; // 20 мс при 48 кГц

@@ -4,7 +4,8 @@ services:
     container_name: cheburgram-server
     restart: unless-stopped
     ports:
-      - "7878:7878/tcp"   # TCP Signaling
+      - "7880:7880/tcp"   # TLS TCP Signaling
+      - "7878:7878/tcp"   # Legacy TCP Notification
       - "7879:7879/udp"   # UDP Media Relay
     volumes:
       - cheburgram-data:/data   # реестр пользователей переживает пересоздание контейнера

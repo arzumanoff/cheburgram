@@ -20,11 +20,12 @@ COPY --from=builder /app/target/release/cheburgram-server /usr/local/bin/cheburg
 # Данные (clients.json) — в /data, монтируется volume'ом и переживает пересоздание контейнера
 VOLUME ["/data"]
 
-# TCP Сигналы: 7878, UDP Медиа-релей: 7879
+# TLS TCP Сигналы: 7880, Legacy TCP: 7878, UDP Медиа-релей: 7879
+EXPOSE 7880/tcp
 EXPOSE 7878/tcp
 EXPOSE 7879/udp
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s \
-  CMD nc -z 127.0.0.1 7878 || exit 1
+  CMD nc -z 127.0.0.1 7880 || exit 1
 
 CMD ["cheburgram-server"]

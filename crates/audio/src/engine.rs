@@ -54,6 +54,8 @@ pub struct AudioHandle {
     pub mic_muted: Arc<AtomicBool>,
     pub output_muted: Arc<AtomicBool>,
     pub mic_level: Arc<AtomicU8>,
+    /// Усиление микрофона, f32 bits (0.5..3.0), по умолчанию 1.0
+    pub mic_gain: Arc<AtomicU32>,
     /// Громкость собеседника, f32 bits (0.0..2.0), по умолчанию 1.0
     pub peer_volume: Arc<AtomicU32>,
     pub stats: AudioStats,
@@ -77,6 +79,7 @@ pub fn start_call_audio(cfg: CallAudioConfig) -> AudioHandle {
         mic_muted: Arc::new(AtomicBool::new(false)),
         output_muted: Arc::new(AtomicBool::new(false)),
         mic_level: Arc::new(AtomicU8::new(0)),
+        mic_gain: Arc::new(AtomicU32::new(1.0f32.to_bits())),
         peer_volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
         stats: AudioStats {
             pkts_sent: Arc::new(AtomicU64::new(0)),
@@ -114,10 +117,11 @@ pub fn start_call_audio(cfg: CallAudioConfig) -> AudioHandle {
         let mic_level = handle.mic_level.clone();
         let pkts_sent = handle.stats.pkts_sent.clone();
         let err_out = handle.error.clone();
+        let mic_gain = handle.mic_gain.clone();
         let dev_name = cfg.input_device.clone();
         handle.threads.push(thread::spawn(move || {
             if let Err(e) = run_capture(
-                dev_name, sock, target, call_id, my_id, stop, mic_muted, mic_level, pkts_sent,
+                dev_name, sock, target, call_id, my_id, stop, mic_muted, mic_level, mic_gain, pkts_sent,
             ) {
                 error!("Захват звука остановлен: {:?}", e);
                 set_err(&err_out, format!("Микрофон: {}", e));
@@ -179,6 +183,7 @@ fn run_capture(
     stop: Arc<AtomicBool>,
     mic_muted: Arc<AtomicBool>,
     mic_level: Arc<AtomicU8>,
+    mic_gain: Arc<AtomicU32>,
     pkts_sent: Arc<AtomicU64>,
 ) -> Result<()> {
     let device = devices::open_input(dev_name.as_deref())
@@ -261,9 +266,14 @@ fn run_capture(
 
     let mut conv = RateConverter::new(in_rate, SAMPLE_RATE);
     let mut ready: Vec<f32> = Vec::with_capacity(FRAME_SIZE * 4);
-    let enc = make_encoder()?;
+    let mut enc = make_encoder()?;
     let mut obuf = vec![0u8; MAX_OPUS_BYTES];
     let mut seq: u32 = 1;
+    let media_key = cheburgram_protocol::derive_media_key(call_id);
+    let mut current_bitrate: i32 = OPUS_BITRATE;
+
+    // RNNoise нейросетевое шумоподавление
+    let mut denoiser = nnnoiseless::DenoiseState::new();
 
     while !stop.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(5));
@@ -275,17 +285,45 @@ fn run_capture(
             ready.extend_from_slice(&conv.push(&chunk));
         }
         while ready.len() >= FRAME_SIZE {
-            let frame: Vec<f32> = ready.drain(..FRAME_SIZE).collect();
-            let rms = (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt();
+            let raw_frame: Vec<f32> = ready.drain(..FRAME_SIZE).collect();
+
+            // Адаптивная подстройка битрейта Opus каждые 200 кадров (~4 сек)
+            if seq % 200 == 0 {
+                let target_bitrate = if pkts_sent.load(Ordering::Relaxed) > 100 {
+                    36_000
+                } else {
+                    OPUS_BITRATE
+                };
+                if target_bitrate != current_bitrate {
+                    if enc.set_bitrate(Bitrate::BitsPerSecond(target_bitrate)).is_ok() {
+                        current_bitrate = target_bitrate;
+                    }
+                }
+            }
+
+            // Подавление шума в двух 480-сэмпловых чанках (10мс)
+            let mut clean_frame = vec![0.0f32; FRAME_SIZE];
+            denoiser.process_frame(&mut clean_frame[0..480], &raw_frame[0..480]);
+            denoiser.process_frame(&mut clean_frame[480..960], &raw_frame[480..960]);
+
+            // Применение усиления микрофона
+            let gain = f32::from_bits(mic_gain.load(Ordering::Relaxed));
+            if (gain - 1.0).abs() > 0.01 {
+                for s in clean_frame.iter_mut() {
+                    *s = (*s * gain).clamp(-1.0, 1.0);
+                }
+            }
+
+            let rms = (clean_frame.iter().map(|s| s * s).sum::<f32>() / clean_frame.len() as f32).sqrt();
             let lvl = ((rms * 6.0).sqrt() * 100.0).min(100.0) as u8;
             mic_level.store(lvl, Ordering::Relaxed);
 
             if mic_muted.load(Ordering::Relaxed) {
                 continue; // DTX: не шлём и не тратим seq — у приёмника тишина без дыр
             }
-            match enc.encode_float(&frame, &mut obuf) {
+            match enc.encode_float(&clean_frame, &mut obuf) {
                 Ok(n) => {
-                    let pkt = MediaPacket::new(call_id, my_id, seq, obuf[..n].to_vec()).encode();
+                    let pkt = MediaPacket::new(call_id, my_id, seq, obuf[..n].to_vec()).encode_encrypted(&media_key);
                     let _ = sock.send_to(&pkt, target);
                     seq = seq.wrapping_add(1);
                     pkts_sent.fetch_add(1, Ordering::Relaxed);
@@ -420,6 +458,7 @@ fn run_playback(
     let mut peers: HashMap<u32, PeerState> = HashMap::new();
     let mut conv_out = RateConverter::new(SAMPLE_RATE, out_rate);
     let mut sbuf = vec![0u8; 65535];
+    let media_key = cheburgram_protocol::derive_media_key(call_id);
 
     // Монотонный планировщик: фрейм ровно каждые 20 мс по нарастающему дедлайну.
     // (В v3.0 тик считался «elapsed >= 20 мс → сброс в now»: реальный период
@@ -430,7 +469,7 @@ fn run_playback(
         // приём пакетов
         match sock.recv_from(&mut sbuf) {
             Ok((n, _)) => {
-                if let Some(pkt) = MediaPacket::decode(&sbuf[..n]) {
+                if let Some(pkt) = MediaPacket::decode_encrypted(&sbuf[..n], &media_key) {
                     if pkt.call_id == call_id && !pkt.is_keepalive && !pkt.payload.is_empty() {
                         let peer = peers.entry(pkt.sender_id).or_insert_with(|| PeerState {
                             jitter: JitterBuffer::default(),
